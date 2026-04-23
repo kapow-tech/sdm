@@ -52,7 +52,11 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 		opts := getFieldOptions(field)
 		if opts.PrimaryKey || opts.Pii || opts.QueryIndex {
 			goType := goTypeForField(field)
-			g.P(field.GoName, " ", goType, " `gorm:\"column:", field.Desc.Name(), ";primaryKey\"`") // Simplified: all are PK for now in definition if needed, but really mostly ID is PK
+			tag := "column:" + string(field.Desc.Name())
+			if opts.PrimaryKey {
+				tag += ";primaryKey"
+			}
+			g.P(field.GoName, " ", goType, " `gorm:\"", tag, "\"`")
 		}
 	}
 	g.P("}")
@@ -180,13 +184,36 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 	filename := file.GeneratedFilenamePrefix + "_sdm_repo.go"
 	g := gen.NewGeneratedFile(filename, file.GoImportPath)
 
+	// Pre-scan to determine which imports are actually needed.
+	needFmt := false
+	needSha256 := false
+	needHex := false
+	for _, msg := range file.Messages {
+		for _, field := range msg.Fields {
+			opts := getFieldOptions(field)
+			if !opts.Pii || opts.Hashed {
+				needFmt = true
+			}
+			if opts.Hashed {
+				needSha256 = true
+				needHex = true
+			}
+		}
+	}
+
 	g.P("package ", file.GoPackageName)
 	g.P()
 	g.P("import (")
 	g.P(`	"context"`)
-	g.P(`	"crypto/sha256"`)
-	g.P(`	"encoding/hex"`)
-	g.P(`	"fmt"`)
+	if needSha256 {
+		g.P(`	"crypto/sha256"`)
+	}
+	if needHex {
+		g.P(`	"encoding/hex"`)
+	}
+	if needFmt {
+		g.P(`	"fmt"`)
+	}
 	g.P(`	"gorm.io/gorm"`)
 	g.P(")")
 	g.P()
