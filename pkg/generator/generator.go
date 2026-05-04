@@ -56,6 +56,11 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 			if opts.PrimaryKey {
 				tag += ";primaryKey"
 			}
+			// uniqueIndex here lets GORM AutoMigrate create the index — actual enforcement
+			// is the DB UNIQUE constraint emitted in the SQL schema.
+			if opts.Unique {
+				tag += ";uniqueIndex"
+			}
 			g.P(field.GoName, " ", goType, " `gorm:\"", tag, "\"`")
 		}
 	}
@@ -108,19 +113,55 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		// PII Table
 		g.P("CREATE TABLE IF NOT EXISTS pii_", modelName, "s (")
 		pkFields := []string{}
+		uniqueFields := []string{}
+		type fkEntry struct{ col, refTable, refCol string }
+		var fkFields []fkEntry
+
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			if opts.PrimaryKey || opts.Pii || opts.QueryIndex {
 				sqlType := sqlTypeForField(field)
-				line := fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType)
+				g.P(fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType))
 				if opts.PrimaryKey {
 					pkFields = append(pkFields, string(field.Desc.Name()))
 				}
-				g.P(line)
+				// UNIQUE constraint is the sole enforcement — no app-level checks.
+				if opts.Unique {
+					uniqueFields = append(uniqueFields, string(field.Desc.Name()))
+				}
+			}
+			// FK fields collected regardless of other annotations since a FK column
+			// is often also a PK (composite FK-PK join tables like Membership).
+			// The DB FOREIGN KEY constraint enforces referential integrity atomically —
+			// no app-level existence checks needed.
+			if opts.References != "" {
+				refTable, refCol := parseReference(opts.References)
+				fkFields = append(fkFields, fkEntry{string(field.Desc.Name()), refTable, refCol})
 			}
 		}
+
+		// Collect all constraints then emit with correct comma handling.
+		type constraint struct{ line string }
+		var constraints []constraint
 		if len(pkFields) > 0 {
-			g.P("  PRIMARY KEY (", strings.Join(pkFields, ", "), ")")
+			constraints = append(constraints, constraint{
+				fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkFields, ", ")),
+			})
+		}
+		for _, uf := range uniqueFields {
+			constraints = append(constraints, constraint{fmt.Sprintf("  UNIQUE (%s)", uf)})
+		}
+		for _, fk := range fkFields {
+			constraints = append(constraints, constraint{
+				fmt.Sprintf("  FOREIGN KEY (%s) REFERENCES %s(%s)", fk.col, fk.refTable, fk.refCol),
+			})
+		}
+		for i, c := range constraints {
+			if i < len(constraints)-1 {
+				g.P(c.line + ",")
+			} else {
+				g.P(c.line)
+			}
 		}
 		g.P(");")
 		g.P()
@@ -220,7 +261,8 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 
 	for _, msg := range file.Messages {
 		modelName := msg.GoIdent.GoName
-		// Repo Interface
+
+		// Repo struct
 		g.P("type ", modelName, "Repo struct {")
 		g.P("  db *gorm.DB")
 		g.P("}")
@@ -231,7 +273,8 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// Save
+		// ── Save ────────────────────────────────────────────────────────────────
+
 		g.P("func (r *", modelName, "Repo) Save(ctx context.Context, model *", modelName, ") error {")
 		g.P("  return r.db.Transaction(func(tx *gorm.DB) error {")
 
@@ -273,8 +316,8 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
-			// Non-PII fields go to chain
-			// CHANGE: also skip PK fields — they are identity columns already in PII, not chain data.
+			// Non-PII fields go to chain.
+			// skip PK fields — they are identity columns already in PII, not chain data.
 			if opts.PrimaryKey {
 				continue
 			}
@@ -304,8 +347,9 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// Fetch
-		// CHANGE: accept one typed param per PK field and build a multi-column WHERE clause,
+		// ── Fetch ────────────────────────────────────────────────────────────────
+
+		// accept one typed param per PK field and build a multi-column WHERE clause,
 		// instead of a single generic "id string" param.
 		fetchParams := make([]string, len(pkFields))
 		whereExprs := make([]string, len(pkFields))
@@ -328,7 +372,75 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("  }")
 		g.P("  return &view, nil")
 		g.P("}")
+		g.P()
+
+		// ── Exists ───────────────────────────────────────────────────────────────
+
+		// Exists is used by other repos to check whether a record is present,
+		// e.g. before building a response or conditional business logic.
+		g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ",
+			strings.Join(fetchParams, ", "), ") (bool, error) {")
+		g.P("  var count int64")
+		g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
+			strings.Join(whereExprs, " AND "), "\", ", strings.Join(whereArgs, ", "), ").Count(&count).Error; err != nil {")
+		g.P("    return false, err")
+		g.P("  }")
+		g.P("  return count > 0, nil")
+		g.P("}")
+		g.P()
+
+		// ── FetchBy{UniqueField} ─────────────────────────────────────────────────
+
+		// unique fields: single-row lookup guaranteed by DB UNIQUE constraint.
+		for _, field := range msg.Fields {
+			opts := getFieldOptions(field)
+			if !opts.Unique {
+				continue
+			}
+			paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+			g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
+				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (*", modelName, "View, error) {")
+			g.P("  var view ", modelName, "View")
+			g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").First(&view).Error; err != nil {")
+			g.P("    return nil, err")
+			g.P("  }")
+			g.P("  return &view, nil")
+			g.P("}")
+			g.P()
+		}
+
+		// composite PK fields: each individual PK field gets a FetchBy returning []View.
+		// e.g. FetchByUserId on Membership returns all memberships for that user.
+		// Only generated when there are multiple PK fields — single PK is already covered by Fetch.
+		if len(pkFields) > 1 {
+			for _, field := range pkFields {
+				paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+				g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
+					"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") ([]", modelName, "View, error) {")
+				g.P("  var views []", modelName, "View")
+				g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").Find(&views).Error; err != nil {")
+				g.P("    return nil, err")
+				g.P("  }")
+				g.P("  return views, nil")
+				g.P("}")
+				g.P()
+			}
+		}
+
+		// NOTE: No Create method is generated. All constraints (UNIQUE, FOREIGN KEY) are
+		// enforced by the DB schema — app-level pre-checks would be racy and redundant.
+		// Callers use Save directly and handle constraint violation errors from the DB.
 	}
+}
+
+// parseReference splits a "MessageName.field_name" references annotation into
+// the PII table name (pii_messagenames) and column name used in SQL FK constraints.
+func parseReference(ref string) (table, column string) {
+	parts := strings.SplitN(ref, ".", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return "pii_" + strings.ToLower(parts[0]) + "s", parts[1]
 }
 
 type SdmOptions struct {
@@ -337,6 +449,8 @@ type SdmOptions struct {
 	Pii                bool
 	QueryIndex         bool
 	Hashed             bool
+	Unique             bool   // marks a field as a unique natural identifier (e.g. aadhaar, pan); enforced by DB UNIQUE constraint
+	References         string // FK target in "MessageName.field_name" format e.g. "Organisation.id"; enforced by DB FOREIGN KEY constraint
 }
 
 func getFieldOptions(field *protogen.Field) SdmOptions {
@@ -350,12 +464,22 @@ func getFieldOptions(field *protogen.Field) SdmOptions {
 		return false
 	}
 
+	// Helper to safely read string extensions.
+	getString := func(ext protoreflect.ExtensionType) string {
+		if proto.HasExtension(opts, ext) {
+			return proto.GetExtension(opts, ext).(string)
+		}
+		return ""
+	}
+
 	return SdmOptions{
 		PrimaryKey:         getBool(sdm.E_PrimaryKey),
 		ChainIdentifierKey: getBool(sdm.E_ChainIdentifierKey),
 		Pii:                getBool(sdm.E_Pii),
 		QueryIndex:         getBool(sdm.E_QueryIndex),
 		Hashed:             getBool(sdm.E_Hashed),
+		Unique:             getBool(sdm.E_Unique),
+		References:         getString(sdm.E_References),
 	}
 }
 
