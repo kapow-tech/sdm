@@ -237,11 +237,12 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 
 		// Prepare PII Struct
 		g.P("    pii := ", modelName, "Pii{")
-		pkField := ""
+		// collect all PK fields instead of a single pkField string, to support composite PKs.
+		var pkFields []*protogen.Field
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			if opts.PrimaryKey {
-				pkField = field.GoName
+				pkFields = append(pkFields, field)
 			}
 			if opts.Pii || opts.PrimaryKey {
 				g.P("      ", field.GoName, ": model.", field.GoName, ",")
@@ -253,12 +254,33 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 
 		// Prepare Chain Entries
 		g.P("    // Save Chain Fields")
+
+		// build a composite key by joining all PK field values with ":".
+		// For single-PK messages this degenerates to fmt.Sprintf("%v", model.Id).
+		if len(pkFields) == 1 {
+			g.P("    compositeKey := fmt.Sprintf(\"%v\", model.", pkFields[0].GoName, ")")
+		} else {
+			fmtParts := make([]string, len(pkFields))
+			argParts := make([]string, len(pkFields))
+			for i, f := range pkFields {
+				fmtParts[i] = "%v"
+				argParts[i] = "model." + f.GoName
+			}
+			g.P("    compositeKey := fmt.Sprintf(\"", strings.Join(fmtParts, ":"), "\", ",
+				strings.Join(argParts, ", "), ")")
+		}
+		g.P()
+
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			// Non-PII fields go to chain
+			// CHANGE: also skip PK fields — they are identity columns already in PII, not chain data.
+			if opts.PrimaryKey {
+				continue
+			}
 			if !opts.Pii {
 				g.P("    if err := tx.Create(&", modelName, "Chain{")
-				g.P("      Key: model.", pkField, ",")
+				g.P("      Key: compositeKey,")
 				g.P("      FieldName: \"", field.Desc.Name(), "\",")
 				g.P("      FieldValue: fmt.Sprintf(\"%v\", model.", field.GoName, "),") // Naive string conversion
 				g.P("    }).Error; err != nil { return err }")
@@ -270,7 +292,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 				g.P("    h_", field.GoName, " := sha256.Sum256([]byte(fmt.Sprintf(\"%v\", model.", field.GoName, ")))")
 				g.P("    hashed_", field.GoName, " := hex.EncodeToString(h_", field.GoName, "[:])")
 				g.P("    if err := tx.Create(&", modelName, "Chain{")
-				g.P("      Key: model.", pkField, ",")
+				g.P("      Key: compositeKey,")
 				g.P("      FieldName: \"hashed_", field.Desc.Name(), "\",")
 				g.P("      FieldValue: hashed_", field.GoName, ",")
 				g.P("    }).Error; err != nil { return err }")
@@ -283,11 +305,25 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P()
 
 		// Fetch
-		g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, id string) (*", modelName, "View, error) {")
+		// CHANGE: accept one typed param per PK field and build a multi-column WHERE clause,
+		// instead of a single generic "id string" param.
+		fetchParams := make([]string, len(pkFields))
+		whereExprs := make([]string, len(pkFields))
+		whereArgs := make([]string, len(pkFields))
+		for i, f := range pkFields {
+			paramName := strings.ToLower(f.GoName[:1]) + f.GoName[1:]
+			fetchParams[i] = paramName + " " + goTypeForField(f)
+			whereExprs[i] = string(f.Desc.Name()) + " = ?"
+			whereArgs[i] = paramName
+		}
+
+		g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ",
+			strings.Join(fetchParams, ", "), ") (*", modelName, "View, error) {")
 		g.P("  var view ", modelName, "View")
 		g.P("  // GORM might not support querying Views directly with First if it doesn't know it's a table. ")
 		g.P("  // But we defined TableName() to return the view name, so it should work.")
-		g.P("  if err := r.db.WithContext(ctx).Where(\"id = ?\", id).First(&view).Error; err != nil {") // Asuming 'id' column exists in view
+		g.P("  if err := r.db.WithContext(ctx).Where(\"", strings.Join(whereExprs, " AND "), "\", ",
+			strings.Join(whereArgs, ", "), ").First(&view).Error; err != nil {")
 		g.P("    return nil, err")
 		g.P("  }")
 		g.P("  return &view, nil")
