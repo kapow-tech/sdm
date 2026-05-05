@@ -18,8 +18,8 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/pluginpb"
 
-	"github.com/jinuthankachan/sdm/pkg/config"
-	"github.com/jinuthankachan/sdm/pkg/generator"
+	"github.com/kapow-tech/sdm/pkg/config"
+	"github.com/kapow-tech/sdm/pkg/generator"
 )
 
 var (
@@ -166,7 +166,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	binaries := []string{
 		"google.golang.org/protobuf/cmd/protoc-gen-go@latest",
 		"github.com/bufbuild/buf/cmd/buf@latest",
-		"github.com/jinuthankachan/sdm/cmd/protoc-gen-sdm@latest",
+		"github.com/kapow-tech/sdm/cmd/protoc-gen-sdm@latest",
 	}
 
 	for _, bin := range binaries {
@@ -210,7 +210,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Exporting sdm protos to %s...\n", sdmProtoDir)
-	exportCmd := exec.Command("buf", "export", "https://github.com/jinuthankachan/sdm.git", "--output", sdmProtoDir)
+	exportCmd := exec.Command("buf", "export", "https://github.com/kapow-tech/sdm.git", "--output", sdmProtoDir)
 	exportCmd.Stdout = os.Stdout
 	exportCmd.Stderr = os.Stderr
 	if err := exportCmd.Run(); err != nil {

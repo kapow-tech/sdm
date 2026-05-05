@@ -1,5 +1,5 @@
 version: v1
-name: buf.build/jinuthankachan/sdm
+name: buf.build/kapow-tech/sdm
 lint:
   use:
     - DEFAULT
