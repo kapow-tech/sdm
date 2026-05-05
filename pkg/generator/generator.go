@@ -225,16 +225,12 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 	filename := file.GeneratedFilenamePrefix + "_sdm_repo.go"
 	g := gen.NewGeneratedFile(filename, file.GoImportPath)
 
-	// Pre-scan to determine which imports are actually needed.
-	needFmt := false
+	// fmt is always needed — compositeKey always uses fmt.Sprintf.
 	needSha256 := false
 	needHex := false
 	for _, msg := range file.Messages {
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
-			if !opts.Pii || opts.Hashed {
-				needFmt = true
-			}
 			if opts.Hashed {
 				needSha256 = true
 				needHex = true
@@ -252,10 +248,9 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 	if needHex {
 		g.P(`	"encoding/hex"`)
 	}
-	if needFmt {
-		g.P(`	"fmt"`)
-	}
+	g.P(`	"fmt"`)
 	g.P(`	"gorm.io/gorm"`)
+	g.P(`	"gorm.io/gorm/clause"`)
 	g.P(")")
 	g.P()
 
@@ -273,35 +268,20 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// ── Save ────────────────────────────────────────────────────────────────
-
-		g.P("func (r *", modelName, "Repo) Save(ctx context.Context, model *", modelName, ") error {")
-		g.P("  return r.db.Transaction(func(tx *gorm.DB) error {")
-
-		// Prepare PII Struct
-		g.P("    pii := ", modelName, "Pii{")
-		// collect all PK fields instead of a single pkField string, to support composite PKs.
+		// collect all PK fields — needed by all write and read methods.
 		var pkFields []*protogen.Field
 		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			if opts.PrimaryKey {
+			if getFieldOptions(field).PrimaryKey {
 				pkFields = append(pkFields, field)
 			}
-			if opts.Pii || opts.PrimaryKey {
-				g.P("      ", field.GoName, ": model.", field.GoName, ",")
-			}
 		}
-		g.P("    }")
-		g.P("    if err := tx.Create(&pii).Error; err != nil { return err }")
-		g.P()
 
-		// Prepare Chain Entries
-		g.P("    // Save Chain Fields")
-
-		// build a composite key by joining all PK field values with ":".
-		// For single-PK messages this degenerates to fmt.Sprintf("%v", model.Id).
+		// compositeKeyExpr is the Go expression that produces the chain key string.
+		// For single-PK messages it is just fmt.Sprintf("%v", model.Id).
+		// For composite-PK messages it joins all PK values with ":".
+		var compositeKeyExpr string
 		if len(pkFields) == 1 {
-			g.P("    compositeKey := fmt.Sprintf(\"%v\", model.", pkFields[0].GoName, ")")
+			compositeKeyExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", model.%s)", pkFields[0].GoName)
 		} else {
 			fmtParts := make([]string, len(pkFields))
 			argParts := make([]string, len(pkFields))
@@ -309,39 +289,91 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 				fmtParts[i] = "%v"
 				argParts[i] = "model." + f.GoName
 			}
-			g.P("    compositeKey := fmt.Sprintf(\"", strings.Join(fmtParts, ":"), "\", ",
-				strings.Join(argParts, ", "), ")")
+			compositeKeyExpr = fmt.Sprintf("fmt.Sprintf(\"%s\", %s)",
+				strings.Join(fmtParts, ":"), strings.Join(argParts, ", "))
 		}
+
+		// emitPiiStruct writes the local pii variable — shared by SavePii and Save.
+		emitPiiStruct := func() {
+			g.P("    pii := ", modelName, "Pii{")
+			for _, field := range msg.Fields {
+				opts := getFieldOptions(field)
+				if opts.Pii || opts.PrimaryKey {
+					g.P("      ", field.GoName, ": model.", field.GoName, ",")
+				}
+			}
+			g.P("    }")
+		}
+
+		// emitChainEntries writes all chain inserts — shared by SaveChain and Save.
+		emitChainEntries := func() {
+			g.P("    compositeKey := ", compositeKeyExpr)
+			for _, field := range msg.Fields {
+				opts := getFieldOptions(field)
+				// skip PK fields — identity columns already in PII, not chain data.
+				if opts.PrimaryKey {
+					continue
+				}
+				if !opts.Pii {
+					g.P("    if err := tx.Create(&", modelName, "Chain{")
+					g.P("      Key:        compositeKey,")
+					g.P("      FieldName:  \"", field.Desc.Name(), "\",")
+					g.P("      FieldValue: fmt.Sprintf(\"%v\", model.", field.GoName, "),") // Naive string conversion
+					g.P("    }).Error; err != nil { return err }")
+				}
+				if opts.Hashed {
+					g.P("    // Hash ", field.GoName)
+					g.P("    h_", field.GoName, " := sha256.Sum256([]byte(fmt.Sprintf(\"%v\", model.", field.GoName, ")))")
+					g.P("    hashed_", field.GoName, " := hex.EncodeToString(h_", field.GoName, "[:])")
+					g.P("    if err := tx.Create(&", modelName, "Chain{")
+					g.P("      Key:        compositeKey,")
+					g.P("      FieldName:  \"hashed_", field.Desc.Name(), "\",")
+					g.P("      FieldValue: hashed_", field.GoName, ",")
+					g.P("    }).Error; err != nil { return err }")
+				}
+			}
+		}
+
+		// ── SavePii ──────────────────────────────────────────────────────────────
+		// Used by the gateway node that directly received the API request.
+		// Inserts only PII synchronously so the caller can return quickly.
+		// Chain data is written later by the same node's worker via SaveChain.
+		g.P("func (r *", modelName, "Repo) SavePii(ctx context.Context, model *", modelName, ") error {")
+		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
+		emitPiiStruct()
+		g.P("    if err := tx.Create(&pii).Error; err != nil { return err }")
+		g.P("    return nil")
+		g.P("  })")
+		g.P("}")
 		g.P()
 
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			// Non-PII fields go to chain.
-			// skip PK fields — they are identity columns already in PII, not chain data.
-			if opts.PrimaryKey {
-				continue
-			}
-			if !opts.Pii {
-				g.P("    if err := tx.Create(&", modelName, "Chain{")
-				g.P("      Key: compositeKey,")
-				g.P("      FieldName: \"", field.Desc.Name(), "\",")
-				g.P("      FieldValue: fmt.Sprintf(\"%v\", model.", field.GoName, "),") // Naive string conversion
-				g.P("    }).Error; err != nil { return err }")
-			}
+		// ── SaveChain ────────────────────────────────────────────────────────────
+		// Used by the local worker on the gateway that received the request,
+		// after the chain has confirmed the transaction.
+		// PII is assumed to already exist — only chain entries are written.
+		g.P("func (r *", modelName, "Repo) SaveChain(ctx context.Context, model *", modelName, ") error {")
+		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
+		g.P("    // Save Chain Fields")
+		emitChainEntries()
+		g.P("    return nil")
+		g.P("  })")
+		g.P("}")
+		g.P()
 
-			// Hashed fields
-			if opts.Hashed {
-				g.P("    // Hash ", field.GoName)
-				g.P("    h_", field.GoName, " := sha256.Sum256([]byte(fmt.Sprintf(\"%v\", model.", field.GoName, ")))")
-				g.P("    hashed_", field.GoName, " := hex.EncodeToString(h_", field.GoName, "[:])")
-				g.P("    if err := tx.Create(&", modelName, "Chain{")
-				g.P("      Key: compositeKey,")
-				g.P("      FieldName: \"hashed_", field.Desc.Name(), "\",")
-				g.P("      FieldValue: hashed_", field.GoName, ",")
-				g.P("    }).Error; err != nil { return err }")
-			}
-		}
-
+		// ── Save ─────────────────────────────────────────────────────────────────
+		// Writes PII (ON CONFLICT DO NOTHING) and chain entries atomically.
+		// Idempotent by design — safe to call from any node's worker regardless of
+		// whether PII was already written by the originally contacted gateway.
+		// Also usable directly when both PII and chain are available upfront (e.g. seeding).
+		g.P("func (r *", modelName, "Repo) Save(ctx context.Context, model *", modelName, ") error {")
+		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
+		emitPiiStruct()
+		g.P("    // ON CONFLICT DO NOTHING — idempotent so any node's worker can call Save")
+		g.P("    // without caring whether the originally contacted gateway already wrote PII.")
+		g.P("    if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pii).Error; err != nil { return err }")
+		g.P()
+		g.P("    // Save Chain Fields")
+		emitChainEntries()
 		g.P("    return nil")
 		g.P("  })")
 		g.P("}")
@@ -429,7 +461,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 
 		// NOTE: No Create method is generated. All constraints (UNIQUE, FOREIGN KEY) are
 		// enforced by the DB schema — app-level pre-checks would be racy and redundant.
-		// Callers use Save directly and handle constraint violation errors from the DB.
+		// Callers use SavePii / SaveChain / Save and handle constraint violation errors from the DB.
 	}
 }
 
