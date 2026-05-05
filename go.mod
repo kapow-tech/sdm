@@ -1,4 +1,4 @@
-module github.com/jinuthankachan/sdm
+module github.com/kapow-tech/sdm
 
 go 1.25.5
 

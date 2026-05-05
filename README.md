@@ -17,7 +17,7 @@ SDM is a toolset for Golang projects to manage sensitive data (PII) by separatin
 
 1.  **Install the Tool**:
     ```bash
-    go install github.com/jinuthankachan/sdm/cmd/sdm@latest
+    go install github.com/kapow-tech/sdm/cmd/sdm@latest
     ```
 
 2. **Configuration**:
@@ -37,7 +37,7 @@ SDM is a toolset for Golang projects to manage sensitive data (PII) by separatin
 
 ## Usage
 
-An example can be found at [SDM examples repo](https://github.com/jinuthankachan/sdm-examples)
+An example can be found at [SDM examples repo](https://github.com/kapow-tech/sdm-examples)
 
 ### 1. Define your Data Model
 
@@ -49,7 +49,7 @@ package invoice;
 
 import "annotations/annotations.proto";
 
-option go_package = "github.com/jinuthankachan/sdm/proto/invoice";
+option go_package = "github.com/kapow-tech/sdm/proto/invoice";
 
 message Invoice {
   string id = 1 [(sdm.primary_key) = true, (sdm.chain_identifier_key) = true];
@@ -84,7 +84,7 @@ This will compile the protos using the `sdm` directory (setup by `sdm setup`) as
 import (
     "context"
     "gorm.io/gorm"
-    "github.com/jinuthankachan/sdm/proto/invoice"
+    "github.com/kapow-tech/sdm/proto/invoice"
     // Ensure the annotations package is available if needed, usually implicitly handled by generated code imports
 )
 
@@ -119,7 +119,7 @@ If you prefer using `buf` directly without the `sdm` wrapper:
 
 1.  **Install the plugin**:
     ```bash
-    go install github.com/jinuthankachan/sdm/cmd/protoc-gen-sdm@latest
+    go install github.com/kapow-tech/sdm/cmd/protoc-gen-sdm@latest
     ```
 2.  **Configure `buf.gen.yaml`**:
     ```yaml
