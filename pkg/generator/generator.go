@@ -35,6 +35,7 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 	g.P()
 	g.P("import (")
 	g.P(`	"time"`)
+	g.P(`	"gorm.io/gorm"`)
 	g.P(")")
 	g.P()
 
@@ -100,6 +101,17 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("func (", modelName, "Pii) TableName() string { return \"pii_", strings.ToLower(modelName), "s\" }")
 	g.P("func (", modelName, "Chain) TableName() string { return \"chain_", strings.ToLower(modelName), "s\" }")
 	g.P("func (", modelName, "View) TableName() string { return \"", strings.ToLower(modelName), "s\" }") // View name
+	g.P()
+
+	// EnsureUnique method
+	g.P("func (c *", modelName, "Chain) EnsureUnique(tx *gorm.DB) bool {")
+	g.P("  var count int64")
+	g.P("  err := tx.Model(&", modelName, "Chain{}).Where(\"field_name = ? AND field_value = ?\", c.FieldName, c.FieldValue).Count(&count).Error")
+	g.P("  if err != nil {")
+	g.P("    return false")
+	g.P("  }")
+	g.P("  return count == 0")
+	g.P("}")
 	g.P()
 }
 
@@ -325,11 +337,22 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 					g.P("    // Hash ", field.GoName)
 					g.P("    h_", field.GoName, " := sha256.Sum256([]byte(fmt.Sprintf(\"%v\", model.", field.GoName, ")))")
 					g.P("    hashed_", field.GoName, " := hex.EncodeToString(h_", field.GoName, "[:])")
-					g.P("    if err := tx.Create(&", modelName, "Chain{")
+					
+					g.P("    hashedChainEntry := &", modelName, "Chain{")
 					g.P("      Key:        compositeKey,")
 					g.P("      FieldName:  \"hashed_", field.Desc.Name(), "\",")
 					g.P("      FieldValue: hashed_", field.GoName, ",")
-					g.P("    }).Error; err != nil { return err }")
+					g.P("    }")
+
+					if opts.Unique {
+						g.P("    if fmt.Sprintf(\"%v\", model.", field.GoName, ") != \"\" {")
+						g.P("      if !hashedChainEntry.EnsureUnique(tx) {")
+						g.P("        return fmt.Errorf(\"duplicate entry for %s\", hashedChainEntry.FieldName)")
+						g.P("      }")
+						g.P("    }")
+					}
+
+					g.P("    if err := tx.Create(hashedChainEntry).Error; err != nil { return err }")
 				}
 			}
 		}
