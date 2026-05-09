@@ -103,6 +103,22 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P()
 }
 
+// sqlCompositeKeyExpr builds the SQL expression that reproduces the compositeKey
+// used when writing chain entries. Must stay in sync with the Go compositeKeyExpr
+// in generateRepo.
+// Single PK:    p.id
+// Composite PK: p.org_id || ':' || p.user_id
+func sqlCompositeKeyExpr(pkCols []string) string {
+	if len(pkCols) == 1 {
+		return "p." + pkCols[0]
+	}
+	parts := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		parts[i] = "p." + col
+	}
+	return strings.Join(parts, " || ':' || ")
+}
+
 func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 	filename := file.GeneratedFilenamePrefix + "_sdm_schema.sql"
 	g := gen.NewGeneratedFile(filename, "")
@@ -112,7 +128,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 
 		// PII Table
 		g.P("CREATE TABLE IF NOT EXISTS pii_", modelName, "s (")
-		pkFields := []string{}
+		pkCols := []string{}
 		uniqueFields := []string{}
 		type fkEntry struct{ col, refTable, refCol string }
 		var fkFields []fkEntry
@@ -123,7 +139,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 				sqlType := sqlTypeForField(field)
 				g.P(fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType))
 				if opts.PrimaryKey {
-					pkFields = append(pkFields, string(field.Desc.Name()))
+					pkCols = append(pkCols, string(field.Desc.Name()))
 				}
 				// UNIQUE constraint is the sole enforcement — no app-level checks.
 				if opts.Unique {
@@ -143,9 +159,9 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		// Collect all constraints then emit with correct comma handling.
 		type constraint struct{ line string }
 		var constraints []constraint
-		if len(pkFields) > 0 {
+		if len(pkCols) > 0 {
 			constraints = append(constraints, constraint{
-				fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkFields, ", ")),
+				fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkCols, ", ")),
 			})
 		}
 		for _, uf := range uniqueFields {
@@ -179,13 +195,18 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		g.P()
 
 		// View
-		// Need to join PII table with latest Chain entries for each hashed field
+		// Need to join PII table with latest Chain entries for each chain field.
+		// The JOIN key must match the compositeKey written by SaveChain:
+		//   single PK:    p.{col}
+		//   composite PK: p.col1 || ':' || p.col2 || ...
 		g.P("CREATE OR REPLACE VIEW ", modelName, "s AS")
 
 		selects := []string{}
 		joins := []string{}
 
-		// PII table alias p
+		// CHANGE: compute the SQL expression for the chain key once, reuse in every JOIN.
+		chainKeyExpr := sqlCompositeKeyExpr(pkCols)
+
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			colName := string(field.Desc.Name())
@@ -194,18 +215,21 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 				// Available in PII table
 				selects = append(selects, fmt.Sprintf("p.%s", colName))
 			} else {
-				// It's a chain field
-				// We need a join for this field
+				// It's a chain field — JOIN on the composite key expression, not hardcoded p.id
 				alias := "c_" + colName
-				joins = append(joins, fmt.Sprintf("LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON p.id = %s.key", modelName, colName, alias, alias))
+				joins = append(joins, fmt.Sprintf(
+					"LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON %s = %s.key",
+					modelName, colName, alias, chainKeyExpr, alias))
 				selects = append(selects, fmt.Sprintf("%s.field_value AS %s", alias, colName))
 			}
 
 			if opts.Hashed {
-				// Also need the hashed value
+				// Also need the hashed value — same JOIN key fix applies
 				hashedName := "hashed_" + colName
 				alias := "c_" + hashedName
-				joins = append(joins, fmt.Sprintf("LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON p.id = %s.key", modelName, hashedName, alias, alias))
+				joins = append(joins, fmt.Sprintf(
+					"LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON %s = %s.key",
+					modelName, hashedName, alias, chainKeyExpr, alias))
 				selects = append(selects, fmt.Sprintf("%s.field_value AS %s", alias, hashedName))
 			}
 		}
@@ -279,6 +303,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		// compositeKeyExpr is the Go expression that produces the chain key string.
 		// For single-PK messages it is just fmt.Sprintf("%v", model.Id).
 		// For composite-PK messages it joins all PK values with ":".
+		// Must stay in sync with sqlCompositeKeyExpr used in the SQL view.
 		var compositeKeyExpr string
 		if len(pkFields) == 1 {
 			compositeKeyExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", model.%s)", pkFields[0].GoName)
