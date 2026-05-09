@@ -62,7 +62,7 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 			if opts.Unique {
 				tag += ";uniqueIndex"
 			}
-			//  autoIncrement tells GORM not to require this field on insert;
+			// autoIncrement tells GORM not to require this field on insert;
 			// the DB BIGSERIAL handles value generation automatically.
 			if opts.AutoIncrement {
 				tag += ";autoIncrement"
@@ -153,7 +153,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			if opts.PrimaryKey || opts.Pii || opts.QueryIndex {
-				//  pass opts so auto_increment fields emit BIGSERIAL instead of BIGINT
+				// pass opts so auto_increment fields emit BIGSERIAL instead of BIGINT
 				sqlType := sqlTypeForField(field, opts)
 				g.P(fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType))
 				if opts.PrimaryKey {
@@ -337,7 +337,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		}
 
 		// emitPiiStruct writes the local pii variable — shared by SavePii and Save.
-		//  auto_increment fields are skipped on insert — DB generates the value.
+		// auto_increment fields are skipped on insert — DB generates the value.
 		emitPiiStruct := func() {
 			g.P("    pii := ", modelName, "Pii{")
 			for _, field := range msg.Fields {
@@ -382,6 +382,17 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			}
 		}
 
+		// emitAutoIncrementCopyback copies DB-generated auto_increment values back to
+		// model after insert so the caller can use model.Id immediately.
+		emitAutoIncrementCopyback := func() {
+			for _, field := range msg.Fields {
+				opts := getFieldOptions(field)
+				if opts.AutoIncrement {
+					g.P("    model.", field.GoName, " = pii.", field.GoName, " // copy DB-generated value back to model")
+				}
+			}
+		}
+
 		// ── SavePii ──────────────────────────────────────────────────────────────
 		// Used by the gateway node that directly received the API request.
 		// Inserts only PII synchronously so the caller can return quickly.
@@ -390,14 +401,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 		emitPiiStruct()
 		g.P("    if err := tx.Create(&pii).Error; err != nil { return err }")
-		//  after insert, copy the DB-generated auto_increment value back to model
-		// so the caller can use model.Id immediately after SavePii returns.
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			if opts.AutoIncrement {
-				g.P("    model.", field.GoName, " = pii.", field.GoName, " // copy DB-generated value back to model")
-			}
-		}
+		emitAutoIncrementCopyback()
 		g.P("    return nil")
 		g.P("  })")
 		g.P("}")
@@ -427,14 +431,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("    // ON CONFLICT DO NOTHING — idempotent so any node's worker can call Save")
 		g.P("    // without caring whether the originally contacted gateway already wrote PII.")
 		g.P("    if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pii).Error; err != nil { return err }")
-		//  copy DB-generated auto_increment value back to model so compositeKey
-		// in chain entries uses the real DB id, not the zero value.
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			if opts.AutoIncrement {
-				g.P("    model.", field.GoName, " = pii.", field.GoName, " // copy DB-generated value back to model")
-			}
-		}
+		emitAutoIncrementCopyback()
 		g.P()
 		g.P("    // Save Chain Fields")
 		emitChainEntries()
@@ -443,10 +440,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// ── Fetch ────────────────────────────────────────────────────────────────
-
-		// accept one typed param per PK field and build a multi-column WHERE clause,
-		// instead of a single generic "id string" param.
+		// build WHERE clause params once — shared by Fetch, Exists, and their By variants.
 		fetchParams := make([]string, len(pkFields))
 		whereExprs := make([]string, len(pkFields))
 		whereArgs := make([]string, len(pkFields))
@@ -456,19 +450,6 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			whereExprs[i] = string(f.Desc.Name()) + " = ?"
 			whereArgs[i] = paramName
 		}
-
-		g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ",
-			strings.Join(fetchParams, ", "), ") (*", modelName, "View, error) {")
-		g.P("  var view ", modelName, "View")
-		g.P("  // GORM might not support querying Views directly with First if it doesn't know it's a table. ")
-		g.P("  // But we defined TableName() to return the view name, so it should work.")
-		g.P("  if err := r.db.WithContext(ctx).Where(\"", strings.Join(whereExprs, " AND "), "\", ",
-			strings.Join(whereArgs, ", "), ").First(&view).Error; err != nil {")
-		g.P("    return nil, err")
-		g.P("  }")
-		g.P("  return &view, nil")
-		g.P("}")
-		g.P()
 
 		// ── Exists ───────────────────────────────────────────────────────────────
 
@@ -482,6 +463,46 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("    return false, err")
 		g.P("  }")
 		g.P("  return count > 0, nil")
+		g.P("}")
+		g.P()
+
+		// ── ExistsBy{UniqueField} ────────────────────────────────────────────────
+
+		// unique fields: existence check by natural identifier.
+		// Generated alongside Exists so callers can check presence without fetching
+		// the full view — e.g. ExistsByUserId, ExistsByOrgId, ExistsByEmail.
+		for _, field := range msg.Fields {
+			opts := getFieldOptions(field)
+			if !opts.Unique {
+				continue
+			}
+			paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+			g.P("func (r *", modelName, "Repo) ExistsBy", field.GoName,
+				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (bool, error) {")
+			g.P("  var count int64")
+			g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
+				field.Desc.Name(), " = ?\", ", paramName, ").Count(&count).Error; err != nil {")
+			g.P("    return false, err")
+			g.P("  }")
+			g.P("  return count > 0, nil")
+			g.P("}")
+			g.P()
+		}
+
+		// ── Fetch ────────────────────────────────────────────────────────────────
+
+		// accept one typed param per PK field and build a multi-column WHERE clause,
+		// instead of a single generic "id string" param.
+		g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ",
+			strings.Join(fetchParams, ", "), ") (*", modelName, "View, error) {")
+		g.P("  var view ", modelName, "View")
+		g.P("  // GORM might not support querying Views directly with First if it doesn't know it's a table. ")
+		g.P("  // But we defined TableName() to return the view name, so it should work.")
+		g.P("  if err := r.db.WithContext(ctx).Where(\"", strings.Join(whereExprs, " AND "), "\", ",
+			strings.Join(whereArgs, ", "), ").First(&view).Error; err != nil {")
+		g.P("    return nil, err")
+		g.P("  }")
+		g.P("  return &view, nil")
 		g.P("}")
 		g.P()
 
@@ -546,7 +567,7 @@ type SdmOptions struct {
 	QueryIndex         bool
 	Hashed             bool
 	Unique             bool   // marks a field as a unique natural identifier (e.g. aadhaar, pan); enforced by DB UNIQUE constraint
-	AutoIncrement      bool   //  emits BIGSERIAL in SQL and autoIncrement GORM tag; DB generates value on insert
+	AutoIncrement      bool   // emits BIGSERIAL in SQL and autoIncrement GORM tag; DB generates value on insert
 	References         string // FK target in "MessageName.field_name" format e.g. "Organisation.id"; enforced by DB FOREIGN KEY constraint
 }
 
@@ -576,7 +597,7 @@ func getFieldOptions(field *protogen.Field) SdmOptions {
 		QueryIndex:         getBool(sdm.E_QueryIndex),
 		Hashed:             getBool(sdm.E_Hashed),
 		Unique:             getBool(sdm.E_Unique),
-		AutoIncrement:      getBool(sdm.E_AutoIncrement), //  read auto_increment annotation
+		AutoIncrement:      getBool(sdm.E_AutoIncrement),
 		References:         getString(sdm.E_References),
 	}
 }
@@ -594,7 +615,6 @@ func goTypeForField(field *protogen.Field) string {
 }
 
 // accepts opts so auto_increment fields emit BIGSERIAL instead of BIGINT.
-//
 // BIGSERIAL is PostgreSQL shorthand for BIGINT + sequence + DEFAULT nextval(...).
 func sqlTypeForField(field *protogen.Field, opts SdmOptions) string {
 	if opts.AutoIncrement {
