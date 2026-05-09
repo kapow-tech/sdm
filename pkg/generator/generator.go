@@ -35,6 +35,7 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 	g.P()
 	g.P("import (")
 	g.P(`	"time"`)
+	g.P(`	"gorm.io/gorm"`)
 	g.P(")")
 	g.P()
 
@@ -100,6 +101,17 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("func (", modelName, "Pii) TableName() string { return \"pii_", strings.ToLower(modelName), "s\" }")
 	g.P("func (", modelName, "Chain) TableName() string { return \"chain_", strings.ToLower(modelName), "s\" }")
 	g.P("func (", modelName, "View) TableName() string { return \"", strings.ToLower(modelName), "s\" }") // View name
+	g.P()
+
+	// EnsureUnique method
+	g.P("func (c *", modelName, "Chain) EnsureUnique(tx *gorm.DB) bool {")
+	g.P("  var count int64")
+	g.P("  err := tx.Model(&", modelName, "Chain{}).Where(\"field_name = ? AND field_value = ?\", c.FieldName, c.FieldValue).Count(&count).Error")
+	g.P("  if err != nil {")
+	g.P("    return false")
+	g.P("  }")
+	g.P("  return count == 0")
+	g.P("}")
 	g.P()
 }
 
