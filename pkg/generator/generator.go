@@ -62,6 +62,11 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 			if opts.Unique {
 				tag += ";uniqueIndex"
 			}
+			//  autoIncrement tells GORM not to require this field on insert;
+			// the DB BIGSERIAL handles value generation automatically.
+			if opts.AutoIncrement {
+				tag += ";autoIncrement"
+			}
 			g.P(field.GoName, " ", goType, " `gorm:\"", tag, "\"`")
 		}
 	}
@@ -148,7 +153,8 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			if opts.PrimaryKey || opts.Pii || opts.QueryIndex {
-				sqlType := sqlTypeForField(field)
+				//  pass opts so auto_increment fields emit BIGSERIAL instead of BIGINT
+				sqlType := sqlTypeForField(field, opts)
 				g.P(fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType))
 				if opts.PrimaryKey {
 					pkCols = append(pkCols, string(field.Desc.Name()))
@@ -216,7 +222,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		selects := []string{}
 		joins := []string{}
 
-		// CHANGE: compute the SQL expression for the chain key once, reuse in every JOIN.
+		// compute the SQL expression for the chain key once, reuse in every JOIN.
 		chainKeyExpr := sqlCompositeKeyExpr(pkCols)
 
 		for _, field := range msg.Fields {
@@ -331,11 +337,16 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		}
 
 		// emitPiiStruct writes the local pii variable — shared by SavePii and Save.
+		//  auto_increment fields are skipped on insert — DB generates the value.
 		emitPiiStruct := func() {
 			g.P("    pii := ", modelName, "Pii{")
 			for _, field := range msg.Fields {
 				opts := getFieldOptions(field)
 				if opts.Pii || opts.PrimaryKey {
+					// skip auto_increment fields — BIGSERIAL generates the value on insert
+					if opts.AutoIncrement {
+						continue
+					}
 					g.P("      ", field.GoName, ": model.", field.GoName, ",")
 				}
 			}
@@ -379,6 +390,14 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 		emitPiiStruct()
 		g.P("    if err := tx.Create(&pii).Error; err != nil { return err }")
+		//  after insert, copy the DB-generated auto_increment value back to model
+		// so the caller can use model.Id immediately after SavePii returns.
+		for _, field := range msg.Fields {
+			opts := getFieldOptions(field)
+			if opts.AutoIncrement {
+				g.P("    model.", field.GoName, " = pii.", field.GoName, " // copy DB-generated value back to model")
+			}
+		}
 		g.P("    return nil")
 		g.P("  })")
 		g.P("}")
@@ -408,6 +427,14 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("    // ON CONFLICT DO NOTHING — idempotent so any node's worker can call Save")
 		g.P("    // without caring whether the originally contacted gateway already wrote PII.")
 		g.P("    if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pii).Error; err != nil { return err }")
+		//  copy DB-generated auto_increment value back to model so compositeKey
+		// in chain entries uses the real DB id, not the zero value.
+		for _, field := range msg.Fields {
+			opts := getFieldOptions(field)
+			if opts.AutoIncrement {
+				g.P("    model.", field.GoName, " = pii.", field.GoName, " // copy DB-generated value back to model")
+			}
+		}
 		g.P()
 		g.P("    // Save Chain Fields")
 		emitChainEntries()
@@ -519,6 +546,7 @@ type SdmOptions struct {
 	QueryIndex         bool
 	Hashed             bool
 	Unique             bool   // marks a field as a unique natural identifier (e.g. aadhaar, pan); enforced by DB UNIQUE constraint
+	AutoIncrement      bool   //  emits BIGSERIAL in SQL and autoIncrement GORM tag; DB generates value on insert
 	References         string // FK target in "MessageName.field_name" format e.g. "Organisation.id"; enforced by DB FOREIGN KEY constraint
 }
 
@@ -548,6 +576,7 @@ func getFieldOptions(field *protogen.Field) SdmOptions {
 		QueryIndex:         getBool(sdm.E_QueryIndex),
 		Hashed:             getBool(sdm.E_Hashed),
 		Unique:             getBool(sdm.E_Unique),
+		AutoIncrement:      getBool(sdm.E_AutoIncrement), //  read auto_increment annotation
 		References:         getString(sdm.E_References),
 	}
 }
@@ -564,7 +593,13 @@ func goTypeForField(field *protogen.Field) string {
 	}
 }
 
-func sqlTypeForField(field *protogen.Field) string {
+// accepts opts so auto_increment fields emit BIGSERIAL instead of BIGINT.
+//
+// BIGSERIAL is PostgreSQL shorthand for BIGINT + sequence + DEFAULT nextval(...).
+func sqlTypeForField(field *protogen.Field, opts SdmOptions) string {
+	if opts.AutoIncrement {
+		return "BIGSERIAL"
+	}
 	switch field.Desc.Kind() {
 	case protoreflect.StringKind:
 		return "TEXT"

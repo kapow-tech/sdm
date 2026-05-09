@@ -78,6 +78,14 @@ var file_sdmprotos_annotations_proto_extTypes = []protoimpl.ExtensionInfo{
 		Tag:           "bytes,50006,opt,name=references",
 		Filename:      "sdmprotos/annotations.proto",
 	},
+	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*bool)(nil),
+		Field:         50007,
+		Name:          "sdm.auto_increment",
+		Tag:           "varint,50007,opt,name=auto_increment",
+		Filename:      "sdmprotos/annotations.proto",
+	},
 }
 
 // Extension fields to descriptorpb.FieldOptions.
@@ -96,6 +104,8 @@ var (
 	E_Unique = &file_sdmprotos_annotations_proto_extTypes[5]
 	// optional string references = 50006;
 	E_References = &file_sdmprotos_annotations_proto_extTypes[6] // FK annotation, format "MessageName.field_name" e.g. "Organisation.id"
+	// optional bool auto_increment = 50007;
+	E_AutoIncrement = &file_sdmprotos_annotations_proto_extTypes[7] // generates BIGSERIAL in SQL and autoIncrement GORM tag
 )
 
 var File_sdmprotos_annotations_proto protoreflect.FileDescriptor
@@ -113,7 +123,8 @@ const file_sdmprotos_annotations_proto_rawDesc = "" +
 	"\x06unique\x12\x1d.google.protobuf.FieldOptions\x18Ն\x03 \x01(\bR\x06unique:?\n" +
 	"\n" +
 	"references\x12\x1d.google.protobuf.FieldOptions\x18ֆ\x03 \x01(\tR\n" +
-	"referencesB)Z'github.com/jinuthankachan/sdm/sdmprotosb\x06proto3"
+	"references:F\n" +
+	"\x0eauto_increment\x12\x1d.google.protobuf.FieldOptions\x18׆\x03 \x01(\bR\rautoIncrementB%Z#github.com/kapow-tech/sdm/sdmprotosb\x06proto3"
 
 var file_sdmprotos_annotations_proto_goTypes = []any{
 	(*descriptorpb.FieldOptions)(nil), // 0: google.protobuf.FieldOptions
@@ -126,10 +137,11 @@ var file_sdmprotos_annotations_proto_depIdxs = []int32{
 	0, // 4: sdm.hashed:extendee -> google.protobuf.FieldOptions
 	0, // 5: sdm.unique:extendee -> google.protobuf.FieldOptions
 	0, // 6: sdm.references:extendee -> google.protobuf.FieldOptions
-	7, // [7:7] is the sub-list for method output_type
-	7, // [7:7] is the sub-list for method input_type
-	7, // [7:7] is the sub-list for extension type_name
-	0, // [0:7] is the sub-list for extension extendee
+	0, // 7: sdm.auto_increment:extendee -> google.protobuf.FieldOptions
+	8, // [8:8] is the sub-list for method output_type
+	8, // [8:8] is the sub-list for method input_type
+	8, // [8:8] is the sub-list for extension type_name
+	0, // [0:8] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
 }
 
@@ -145,7 +157,7 @@ func file_sdmprotos_annotations_proto_init() {
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sdmprotos_annotations_proto_rawDesc), len(file_sdmprotos_annotations_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   0,
-			NumExtensions: 7,
+			NumExtensions: 8,
 			NumServices:   0,
 		},
 		GoTypes:           file_sdmprotos_annotations_proto_goTypes,
