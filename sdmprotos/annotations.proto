@@ -14,4 +14,5 @@ extend google.protobuf.FieldOptions {
   bool hashed = 50004;
   bool unique = 50005;
   string references = 50006; // FK annotation, format "MessageName.field_name" e.g. "Organisation.id"
+  bool auto_increment = 50007; // generates BIGSERIAL in SQL and autoIncrement GORM tag
 }
