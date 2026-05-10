@@ -120,17 +120,61 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P()
 }
 
+// chainKeyCols returns the columns used as the chain key for a message.
+// If any field has chain_identifier_key set, those are used — this allows
+// using a stable UUID instead of an auto-incremented integer PK as the chain key,
+// keeping chain data portable and opaque.
+// Falls back to PK columns if no chain_identifier_key is annotated.
+func chainKeyCols(msg *protogen.Message) []string {
+	var cols []string
+	for _, field := range msg.Fields {
+		if getFieldOptions(field).ChainIdentifierKey {
+			cols = append(cols, string(field.Desc.Name()))
+		}
+	}
+	if len(cols) > 0 {
+		return cols
+	}
+	// fallback to PKs
+	for _, field := range msg.Fields {
+		if getFieldOptions(field).PrimaryKey {
+			cols = append(cols, string(field.Desc.Name()))
+		}
+	}
+	return cols
+}
+
+// chainKeyGoFields returns the protogen fields used as the chain key.
+// Mirrors chainKeyCols but returns fields so the repo generator can access GoName.
+func chainKeyGoFields(msg *protogen.Message) []*protogen.Field {
+	var fields []*protogen.Field
+	for _, field := range msg.Fields {
+		if getFieldOptions(field).ChainIdentifierKey {
+			fields = append(fields, field)
+		}
+	}
+	if len(fields) > 0 {
+		return fields
+	}
+	for _, field := range msg.Fields {
+		if getFieldOptions(field).PrimaryKey {
+			fields = append(fields, field)
+		}
+	}
+	return fields
+}
+
 // sqlCompositeKeyExpr builds the SQL expression that reproduces the compositeKey
 // used when writing chain entries. Must stay in sync with the Go compositeKeyExpr
 // in generateRepo.
-// Single PK:    p.id
-// Composite PK: p.org_id || ':' || p.user_id
-func sqlCompositeKeyExpr(pkCols []string) string {
-	if len(pkCols) == 1 {
-		return "p." + pkCols[0]
+// Single key field:    p.user_id
+// Multiple key fields: p.org_id || ':' || p.user_id
+func sqlCompositeKeyExpr(keyCols []string) string {
+	if len(keyCols) == 1 {
+		return "p." + keyCols[0]
 	}
-	parts := make([]string, len(pkCols))
-	for i, col := range pkCols {
+	parts := make([]string, len(keyCols))
+	for i, col := range keyCols {
 		parts[i] = "p." + col
 	}
 	return strings.Join(parts, " || ':' || ")
@@ -214,16 +258,15 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 
 		// View
 		// Need to join PII table with latest Chain entries for each chain field.
-		// The JOIN key must match the compositeKey written by SaveChain:
-		//   single PK:    p.{col}
-		//   composite PK: p.col1 || ':' || p.col2 || ...
+		// The JOIN key uses chain_identifier_key cols if annotated, else PK cols.
+		// This matches the compositeKey written by SaveChain in the repo.
 		g.P("CREATE OR REPLACE VIEW ", modelName, "s AS")
 
 		selects := []string{}
 		joins := []string{}
 
-		// compute the SQL expression for the chain key once, reuse in every JOIN.
-		chainKeyExpr := sqlCompositeKeyExpr(pkCols)
+		// use chain_identifier_key cols for JOIN if set, else fall back to PKs.
+		chainKeyExpr := sqlCompositeKeyExpr(chainKeyCols(msg))
 
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
@@ -233,7 +276,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 				// Available in PII table
 				selects = append(selects, fmt.Sprintf("p.%s", colName))
 			} else {
-				// It's a chain field — JOIN on the composite key expression, not hardcoded p.id
+				// It's a chain field — JOIN on chain key expression
 				alias := "c_" + colName
 				joins = append(joins, fmt.Sprintf(
 					"LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON %s = %s.key",
@@ -242,7 +285,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			}
 
 			if opts.Hashed {
-				// Also need the hashed value — same JOIN key fix applies
+				// Also need the hashed value — same JOIN key applies
 				hashedName := "hashed_" + colName
 				alias := "c_" + hashedName
 				joins = append(joins, fmt.Sprintf(
@@ -310,7 +353,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// collect all PK fields — needed by all write and read methods.
+		// collect all PK fields — needed by Fetch, Exists, and their param lists.
 		var pkFields []*protogen.Field
 		for _, field := range msg.Fields {
 			if getFieldOptions(field).PrimaryKey {
@@ -319,16 +362,18 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		}
 
 		// compositeKeyExpr is the Go expression that produces the chain key string.
-		// For single-PK messages it is just fmt.Sprintf("%v", model.Id).
-		// For composite-PK messages it joins all PK values with ":".
+		// Uses chain_identifier_key fields if annotated (e.g. user_id UUID), else PKs.
+		// Using a UUID keeps chain keys stable and opaque even when the PK is an
+		// auto-incremented integer that could leak insertion order.
 		// Must stay in sync with sqlCompositeKeyExpr used in the SQL view.
+		keyFields := chainKeyGoFields(msg)
 		var compositeKeyExpr string
-		if len(pkFields) == 1 {
-			compositeKeyExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", model.%s)", pkFields[0].GoName)
+		if len(keyFields) == 1 {
+			compositeKeyExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", model.%s)", keyFields[0].GoName)
 		} else {
-			fmtParts := make([]string, len(pkFields))
-			argParts := make([]string, len(pkFields))
-			for i, f := range pkFields {
+			fmtParts := make([]string, len(keyFields))
+			argParts := make([]string, len(keyFields))
+			for i, f := range keyFields {
 				fmtParts[i] = "%v"
 				argParts[i] = "model." + f.GoName
 			}
@@ -440,7 +485,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// build WHERE clause params once — shared by Fetch, Exists, and their By variants.
+		// build WHERE clause params once — shared by Fetch and Exists.
 		fetchParams := make([]string, len(pkFields))
 		whereExprs := make([]string, len(pkFields))
 		whereArgs := make([]string, len(pkFields))
@@ -449,44 +494,6 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			fetchParams[i] = paramName + " " + goTypeForField(f)
 			whereExprs[i] = string(f.Desc.Name()) + " = ?"
 			whereArgs[i] = paramName
-		}
-
-		// ── Exists ───────────────────────────────────────────────────────────────
-
-		// Exists is used by other repos to check whether a record is present,
-		// e.g. before building a response or conditional business logic.
-		g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ",
-			strings.Join(fetchParams, ", "), ") (bool, error) {")
-		g.P("  var count int64")
-		g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
-			strings.Join(whereExprs, " AND "), "\", ", strings.Join(whereArgs, ", "), ").Count(&count).Error; err != nil {")
-		g.P("    return false, err")
-		g.P("  }")
-		g.P("  return count > 0, nil")
-		g.P("}")
-		g.P()
-
-		// ── ExistsBy{UniqueField} ────────────────────────────────────────────────
-
-		// unique fields: existence check by natural identifier.
-		// Generated alongside Exists so callers can check presence without fetching
-		// the full view — e.g. ExistsByUserId, ExistsByOrgId, ExistsByEmail.
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			if !opts.Unique {
-				continue
-			}
-			paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
-			g.P("func (r *", modelName, "Repo) ExistsBy", field.GoName,
-				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (bool, error) {")
-			g.P("  var count int64")
-			g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
-				field.Desc.Name(), " = ?\", ", paramName, ").Count(&count).Error; err != nil {")
-			g.P("    return false, err")
-			g.P("  }")
-			g.P("  return count > 0, nil")
-			g.P("}")
-			g.P()
 		}
 
 		// ── Fetch ────────────────────────────────────────────────────────────────
@@ -544,6 +551,44 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			}
 		}
 
+		// ── Exists ───────────────────────────────────────────────────────────────
+
+		// Exists is used by other repos to check whether a record is present,
+		// e.g. before building a response or conditional business logic.
+		g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ",
+			strings.Join(fetchParams, ", "), ") (bool, error) {")
+		g.P("  var count int64")
+		g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
+			strings.Join(whereExprs, " AND "), "\", ", strings.Join(whereArgs, ", "), ").Count(&count).Error; err != nil {")
+		g.P("    return false, err")
+		g.P("  }")
+		g.P("  return count > 0, nil")
+		g.P("}")
+		g.P()
+
+		// ── ExistsBy{UniqueField} ────────────────────────────────────────────────
+
+		// unique fields: existence check by natural identifier.
+		// Generated alongside Exists so callers can check presence without fetching
+		// the full view — e.g. ExistsByUserId, ExistsByOrgId, ExistsByEmail.
+		for _, field := range msg.Fields {
+			opts := getFieldOptions(field)
+			if !opts.Unique {
+				continue
+			}
+			paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+			g.P("func (r *", modelName, "Repo) ExistsBy", field.GoName,
+				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (bool, error) {")
+			g.P("  var count int64")
+			g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
+				field.Desc.Name(), " = ?\", ", paramName, ").Count(&count).Error; err != nil {")
+			g.P("    return false, err")
+			g.P("  }")
+			g.P("  return count > 0, nil")
+			g.P("}")
+			g.P()
+		}
+
 		// NOTE: No Create method is generated. All constraints (UNIQUE, FOREIGN KEY) are
 		// enforced by the DB schema — app-level pre-checks would be racy and redundant.
 		// Callers use SavePii / SaveChain / Save and handle constraint violation errors from the DB.
@@ -562,7 +607,7 @@ func parseReference(ref string) (table, column string) {
 
 type SdmOptions struct {
 	PrimaryKey         bool
-	ChainIdentifierKey bool
+	ChainIdentifierKey bool // if set, this field is used as the chain key instead of the PK
 	Pii                bool
 	QueryIndex         bool
 	Hashed             bool
