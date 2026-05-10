@@ -607,7 +607,7 @@ func parseReference(ref string) (table, column string) {
 
 type SdmOptions struct {
 	PrimaryKey         bool
-	ChainIdentifierKey bool   // if set, this field is used as the chain key instead of the PK
+	ChainIdentifierKey bool // if set, this field is used as the chain key instead of the PK
 	Pii                bool
 	QueryIndex         bool
 	Hashed             bool
