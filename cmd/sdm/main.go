@@ -380,11 +380,18 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create plugin: %w", err)
 	}
 
+	var firstFile *protogen.File
 	for _, f := range gen.Files {
 		if !f.Generate {
 			continue
 		}
 		generator.GenerateFile(gen, f)
+		if firstFile == nil {
+			firstFile = f
+		}
+	}
+	if firstFile != nil {
+		generator.GenerateHelpers(gen, firstFile) // emits sdm_helpers.go once
 	}
 
 	response := gen.Response()
