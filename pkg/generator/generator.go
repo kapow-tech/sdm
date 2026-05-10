@@ -353,6 +353,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
+		// collect all PK fields — needed by Fetch, Exists, and their param lists.
 		var pkFields []*protogen.Field
 		for _, field := range msg.Fields {
 			if getFieldOptions(field).PrimaryKey {
@@ -360,6 +361,11 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			}
 		}
 
+		// compositeKeyExpr is the Go expression that produces the chain key string.
+		// Uses chain_identifier_key fields if annotated (e.g. user_id UUID), else PKs.
+		// Using a UUID keeps chain keys stable and opaque even when the PK is an
+		// auto-incremented integer that could leak insertion order.
+		// Must stay in sync with sqlCompositeKeyExpr used in the SQL view.
 		keyFields := chainKeyGoFields(msg)
 		var compositeKeyExpr string
 		if len(keyFields) == 1 {
@@ -469,6 +475,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
+		// build WHERE clause params once — shared by Fetch and Exists.
 		fetchParams := make([]string, len(pkFields))
 		whereExprs := make([]string, len(pkFields))
 		whereArgs := make([]string, len(pkFields))
@@ -570,7 +577,7 @@ func parseReference(ref string) (table, column string) {
 
 type SdmOptions struct {
 	PrimaryKey         bool
-	ChainIdentifierKey bool
+	ChainIdentifierKey bool // if set, this field is used as the chain key instead of the PK
 	Pii                bool
 	QueryIndex         bool
 	Hashed             bool
