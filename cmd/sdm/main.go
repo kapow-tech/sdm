@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -380,18 +381,21 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create plugin: %w", err)
 	}
 
-	var firstFile *protogen.File
+	// Emit sdm_helpers.go once per output directory (≈ Go package). Using a single
+	// "firstFile" only works when all user protos share one package — with two
+	// packages (e.g. invoice/, user/) the second package ends up without helpers,
+	// missing pgArrayLiteral and the protojson serializer init().
+	emittedHelpers := map[string]bool{}
 	for _, f := range gen.Files {
 		if !f.Generate {
 			continue
 		}
 		generator.GenerateFile(gen, f)
-		if firstFile == nil {
-			firstFile = f
+		dir := path.Dir(f.GeneratedFilenamePrefix)
+		if !emittedHelpers[dir] {
+			generator.GenerateHelpers(gen, f)
+			emittedHelpers[dir] = true
 		}
-	}
-	if firstFile != nil {
-		generator.GenerateHelpers(gen, firstFile) // emits sdm_helpers.go once
 	}
 
 	response := gen.Response()
