@@ -15,4 +15,5 @@ extend google.protobuf.FieldOptions {
   bool unique = 50005;
   string references = 50006; // FK annotation, format "MessageName.field_name" e.g. "Organisation.id"
   bool auto_increment = 50007; // generates BIGSERIAL in SQL and autoIncrement GORM tag
+  bool json = 50008; // string field stored as Postgres JSONB and Go datatypes.JSON
 }
