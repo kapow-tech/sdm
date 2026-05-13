@@ -185,6 +185,12 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 			g.P(field.GoName, " ", goType, " `gorm:\"", tag, "\"`")
 		}
 	}
+	// Default audit fields on every PII model. GORM populates CreatedAt and
+	// UpdatedAt on INSERT/UPDATE by name convention; IsDeleted is a soft-delete
+	// flag that the generated read methods filter on.
+	g.P("CreatedAt time.Time `gorm:\"column:created_at;autoCreateTime\"`")
+	g.P("UpdatedAt time.Time `gorm:\"column:updated_at;autoUpdateTime\"`")
+	g.P("IsDeleted bool `gorm:\"column:is_deleted;default:false\"`")
 	g.P("}")
 	g.P()
 
@@ -217,6 +223,10 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 			g.P("Hashed", field.GoName, " string `gorm:\"column:hashed_", field.Desc.Name(), "\"`")
 		}
 	}
+	// Audit columns surfaced from the PII table on the view.
+	g.P("CreatedAt time.Time `gorm:\"column:created_at\"`")
+	g.P("UpdatedAt time.Time `gorm:\"column:updated_at\"`")
+	g.P("IsDeleted bool `gorm:\"column:is_deleted\"`")
 	g.P("TxHash string `gorm:\"column:tx_hash\"`")
 	g.P("}")
 	g.P()
@@ -330,6 +340,12 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			}
 		}
 
+		// Default audit columns on every PII table. The Go-side counterparts on
+		// {Model}Pii / {Model}View are spliced in by generateMessageModels.
+		g.P("  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,")
+		g.P("  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,")
+		g.P("  is_deleted BOOLEAN NOT NULL DEFAULT FALSE,")
+
 		type constraint struct{ line string }
 		var constraints []constraint
 		if len(pkCols) > 0 {
@@ -431,6 +447,10 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 				selects = append(selects, fmt.Sprintf("%s.field_value AS %s", alias, hashedName))
 			}
 		}
+
+		// Surface PII audit columns through the view so callers can read them
+		// without joining pii_X separately.
+		selects = append(selects, "p.created_at", "p.updated_at", "p.is_deleted")
 
 		g.P("  SELECT")
 		g.P("    ", strings.Join(selects, ",\n    "))
@@ -689,12 +709,16 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			whereArgs[i] = paramName
 		}
 
+		// notDeleted is the soft-delete filter appended to every read method.
+		// Driven by the IsDeleted column on the PII table; the view inherits it.
+		const notDeleted = `.Where("is_deleted = ?", false)`
+
 		// ── Fetch ────────────────────────────────────────────────────────────────
 		g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ",
 			strings.Join(fetchParams, ", "), ") (*", modelName, "View, error) {")
 		g.P("  var view ", modelName, "View")
 		g.P("  if err := r.db.WithContext(ctx).Where(\"", strings.Join(whereExprs, " AND "), "\", ",
-			strings.Join(whereArgs, ", "), ").First(&view).Error; err != nil {")
+			strings.Join(whereArgs, ", "), ")", notDeleted, ".First(&view).Error; err != nil {")
 		g.P("    return nil, err")
 		g.P("  }")
 		g.P("  return &view, nil")
@@ -711,7 +735,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
 				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (*", modelName, "View, error) {")
 			g.P("  var view ", modelName, "View")
-			g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").First(&view).Error; err != nil {")
+			g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ")", notDeleted, ".First(&view).Error; err != nil {")
 			g.P("    return nil, err")
 			g.P("  }")
 			g.P("  return &view, nil")
@@ -726,7 +750,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 				g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
 					"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") ([]", modelName, "View, error) {")
 				g.P("  var views []", modelName, "View")
-				g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").Find(&views).Error; err != nil {")
+				g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ")", notDeleted, ".Find(&views).Error; err != nil {")
 				g.P("    return nil, err")
 				g.P("  }")
 				g.P("  return views, nil")
@@ -740,7 +764,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			strings.Join(fetchParams, ", "), ") (bool, error) {")
 		g.P("  var count int64")
 		g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
-			strings.Join(whereExprs, " AND "), "\", ", strings.Join(whereArgs, ", "), ").Count(&count).Error; err != nil {")
+			strings.Join(whereExprs, " AND "), "\", ", strings.Join(whereArgs, ", "), ")", notDeleted, ".Count(&count).Error; err != nil {")
 		g.P("    return false, err")
 		g.P("  }")
 		g.P("  return count > 0, nil")
@@ -758,7 +782,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (bool, error) {")
 			g.P("  var count int64")
 			g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
-				field.Desc.Name(), " = ?\", ", paramName, ").Count(&count).Error; err != nil {")
+				field.Desc.Name(), " = ?\", ", paramName, ")", notDeleted, ".Count(&count).Error; err != nil {")
 			g.P("    return false, err")
 			g.P("  }")
 			g.P("  return count > 0, nil")
