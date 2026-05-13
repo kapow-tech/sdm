@@ -164,7 +164,7 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("type ", modelName, "Pii struct {")
 	for _, field := range msg.Fields {
 		opts := getFieldOptions(field)
-		if opts.PrimaryKey || opts.Pii || opts.QueryIndex {
+		if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
 			goType := goTypeForField(field)
 			tag := "column:" + string(field.Desc.Name())
 			if opts.PrimaryKey {
@@ -311,7 +311,10 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
-			if opts.PrimaryKey || opts.Pii || opts.QueryIndex {
+			// References fields must materialize as PII columns so the FK constraint
+			// has a column to attach to. Otherwise CREATE TABLE fails with "column
+			// X referenced in foreign key constraint does not exist."
+			if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
 				sqlType := sqlTypeForField(field, opts)
 				g.P(fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType))
 				if opts.PrimaryKey {
@@ -403,7 +406,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			opts := getFieldOptions(field)
 			colName := string(field.Desc.Name())
 
-			if opts.PrimaryKey || opts.Pii || opts.QueryIndex {
+			if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
 				selects = append(selects, fmt.Sprintf("p.%s", colName))
 			} else {
 				alias := "c_" + colName
@@ -553,14 +556,16 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		}
 
 		chainAccept := func(field *protogen.Field, opts SdmOptions) bool {
-			return !opts.PrimaryKey && !opts.Pii
+			// References fields live in the PII table (the FK is on the PII column);
+			// don't double-record them in the chain.
+			return !opts.PrimaryKey && !opts.Pii && opts.References == ""
 		}
 
 		emitPiiStruct := func() {
 			g.P("    pii := ", modelName, "Pii{")
 			for _, field := range msg.Fields {
 				opts := getFieldOptions(field)
-				if opts.Pii || opts.PrimaryKey {
+				if opts.Pii || opts.PrimaryKey || opts.References != "" {
 					if opts.AutoIncrement {
 						continue
 					}
@@ -588,6 +593,9 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 				opts := getFieldOptions(field)
 				if opts.PrimaryKey {
 					continue
+				}
+				if opts.References != "" {
+					continue // references field is in PII, not chain
 				}
 				if !opts.Pii {
 					// FIX: repeated fields must be serialised as a PG array literal.
@@ -928,7 +936,7 @@ func fileHasChainMessageField(file *protogen.File) bool {
 				continue
 			}
 			opts := getFieldOptions(field)
-			if !opts.Pii && !opts.PrimaryKey {
+			if !opts.Pii && !opts.PrimaryKey && opts.References == "" {
 				return true
 			}
 		}
