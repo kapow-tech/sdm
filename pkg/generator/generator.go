@@ -144,7 +144,9 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 			continue
 		}
 		for _, field := range msg.Fields {
-			if field.Desc.IsList() {
+			// Repeated scalar fields use pq.StringArray.
+			// Repeated message fields use datatypes.JSON instead — no pq needed for them.
+			if field.Desc.IsList() && field.Desc.Kind() != protoreflect.MessageKind {
 				needPq = true
 				break
 			}
@@ -157,7 +159,10 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 	g.P()
 	g.P("import (")
 	g.P(`	"time"`)
-	if fileHasStringJsonField(file) {
+	// datatypes.JSON is used in the view struct for repeated message fields
+	// (stored as JSON array in chain, exposed as ::jsonb in the view) in addition
+	// to string fields annotated (sdm.json)=true.
+	if fileHasStringJsonField(file) || fileHasRepeatedMessageField(file) {
 		g.P(`	"gorm.io/datatypes"`)
 	}
 	if needPq {
@@ -177,36 +182,39 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 
 func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	modelName := msg.GoIdent.GoName
+	chainOnly := isChainOnly(msg)
 
-	// PII Table Structure
-	g.P("type ", modelName, "Pii struct {")
-	for _, field := range msg.Fields {
-		opts := getFieldOptions(field)
-		if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
-			goType := goTypeForField(field)
-			tag := "column:" + string(field.Desc.Name())
-			if opts.PrimaryKey {
-				tag += ";primaryKey"
+	// ── PII Table Structure (skipped for chain-only messages) ────────────────
+	if !chainOnly {
+		g.P("type ", modelName, "Pii struct {")
+		for _, field := range msg.Fields {
+			opts := getFieldOptions(field)
+			if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
+				goType := goTypeForField(field)
+				tag := "column:" + string(field.Desc.Name())
+				if opts.PrimaryKey {
+					tag += ";primaryKey"
+				}
+				if opts.Unique {
+					tag += ";uniqueIndex"
+				}
+				if opts.AutoIncrement {
+					tag += ";autoIncrement"
+				}
+				if isJsonStored(field, opts) {
+					tag += ";type:jsonb"
+				}
+				if needsProtojsonMarshal(field) {
+					tag += ";serializer:protojson"
+				}
+				g.P(field.GoName, " ", goType, " `gorm:\"", tag, "\"`")
 			}
-			if opts.Unique {
-				tag += ";uniqueIndex"
-			}
-			if opts.AutoIncrement {
-				tag += ";autoIncrement"
-			}
-			if isJsonStored(field, opts) {
-				tag += ";type:jsonb"
-			}
-			if needsProtojsonMarshal(field) {
-				tag += ";serializer:protojson"
-			}
-			g.P(field.GoName, " ", goType, " `gorm:\"", tag, "\"`")
 		}
+		g.P("}")
+		g.P()
 	}
-	g.P("}")
-	g.P()
 
-	// Chain Table Structure
+	// ── Chain Table Structure ─────────────────────────────────────────────────
 	g.P("type ", modelName, "Chain struct {")
 	g.P("Key string `gorm:\"primaryKey;column:key\"`")
 	g.P("FieldName string `gorm:\"primaryKey;column:field_name\"`")
@@ -217,17 +225,22 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("}")
 	g.P()
 
-	// View Structure (Combined)
-	// FIX: repeated (list) fields use pq.StringArray instead of []string.
-	// pq.StringArray implements driver.Valuer and sql.Scanner so GORM can
-	// scan a text[] column directly. Plain []string has no such implementation
-	// and causes "unsupported data type: &[]" at startup.
+	// ── View Structure ────────────────────────────────────────────────────────
+	// FIX: repeated scalar fields use pq.StringArray (text[] column).
+	// FIX: repeated message fields use datatypes.JSON (jsonb column) — they are
+	// stored as a JSON array in chain field_value and cast ::jsonb in the view.
+	// Plain []string / []*T have no sql.Scanner and cause startup panics.
 	g.P("type ", modelName, "View struct {")
 	for _, field := range msg.Fields {
 		var goType, viewTag string
 		if field.Desc.IsList() {
-			goType = "pq.StringArray"
-			viewTag = fmt.Sprintf("column:%s;type:text[]", field.Desc.Name())
+			if field.Desc.Kind() == protoreflect.MessageKind {
+				goType = "datatypes.JSON"
+				viewTag = fmt.Sprintf("column:%s;type:jsonb", field.Desc.Name())
+			} else {
+				goType = "pq.StringArray"
+				viewTag = fmt.Sprintf("column:%s;type:text[]", field.Desc.Name())
+			}
 		} else {
 			goType = goTypeForField(field)
 			viewTag = "column:" + string(field.Desc.Name())
@@ -249,13 +262,15 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("}")
 	g.P()
 
-	// TableName overrides
-	g.P("func (", modelName, "Pii) TableName() string { return \"pii_", strings.ToLower(modelName), "s\" }")
+	// ── TableName overrides ───────────────────────────────────────────────────
+	if !chainOnly {
+		g.P("func (", modelName, "Pii) TableName() string { return \"pii_", strings.ToLower(modelName), "s\" }")
+	}
 	g.P("func (", modelName, "Chain) TableName() string { return \"chain_", strings.ToLower(modelName), "s\" }")
 	g.P("func (", modelName, "View) TableName() string { return \"", strings.ToLower(modelName), "s\" }")
 	g.P()
 
-	// EnsureUnique method
+	// ── EnsureUnique method ───────────────────────────────────────────────────
 	g.P("func (c *", modelName, "Chain) EnsureUnique(tx *gorm.DB) bool {")
 	g.P("  var count int64")
 	g.P("  err := tx.Model(&", modelName, "Chain{}).Where(\"field_name = ? AND field_value = ?\", c.FieldName, c.FieldValue).Count(&count).Error")
@@ -306,13 +321,14 @@ func chainKeyGoFields(msg *protogen.Message) []*protogen.Field {
 }
 
 // sqlCompositeKeyExpr builds the SQL expression that reproduces the compositeKey.
-func sqlCompositeKeyExpr(keyCols []string) string {
+// For chain-only messages the anchor alias is "keys"; for PII-backed messages it is "p".
+func sqlCompositeKeyExpr(keyCols []string, tableAlias string) string {
 	if len(keyCols) == 1 {
-		return "p." + keyCols[0]
+		return tableAlias + "." + keyCols[0]
 	}
 	parts := make([]string, len(keyCols))
 	for i, col := range keyCols {
-		parts[i] = "p." + col
+		parts[i] = tableAlias + "." + col
 	}
 	return strings.Join(parts, " || ':' || ")
 }
@@ -329,65 +345,64 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			continue
 		}
 		modelName := strings.ToLower(msg.GoIdent.GoName)
+		chainOnly := isChainOnly(msg)
 
-		// PII Table
-		g.P("CREATE TABLE IF NOT EXISTS pii_", modelName, "s (")
-		pkCols := []string{}
-		uniqueFields := []string{}
-		type fkEntry struct{ col, refTable, refCol string }
-		var fkFields []fkEntry
+		// ── PII Table (skipped for chain-only messages) ───────────────────────
+		if !chainOnly {
+			g.P("CREATE TABLE IF NOT EXISTS pii_", modelName, "s (")
+			pkCols := []string{}
+			uniqueFields := []string{}
+			type fkEntry struct{ col, refTable, refCol string }
+			var fkFields []fkEntry
 
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			// References fields must materialize as PII columns so the FK constraint
-			// has a column to attach to. Otherwise CREATE TABLE fails with "column
-			// X referenced in foreign key constraint does not exist."
-			if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
-				sqlType := sqlTypeForField(field, opts)
-				g.P(fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType))
-				if opts.PrimaryKey {
-					pkCols = append(pkCols, string(field.Desc.Name()))
+			for _, field := range msg.Fields {
+				opts := getFieldOptions(field)
+				if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
+					sqlType := sqlTypeForField(field, opts)
+					g.P(fmt.Sprintf("  %s %s,", field.Desc.Name(), sqlType))
+					if opts.PrimaryKey {
+						pkCols = append(pkCols, string(field.Desc.Name()))
+					}
+					if opts.Unique {
+						uniqueFields = append(uniqueFields, string(field.Desc.Name()))
+					}
 				}
-				if opts.Unique {
-					uniqueFields = append(uniqueFields, string(field.Desc.Name()))
+				if opts.References != "" {
+					refTable, refCol := parseReference(opts.References)
+					fkFields = append(fkFields, fkEntry{string(field.Desc.Name()), refTable, refCol})
 				}
 			}
-			if opts.References != "" {
-				refTable, refCol := parseReference(opts.References)
-				fkFields = append(fkFields, fkEntry{string(field.Desc.Name()), refTable, refCol})
+
+			type constraint struct{ line string }
+			var constraints []constraint
+			if len(pkCols) > 0 {
+				constraints = append(constraints, constraint{
+					fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkCols, ", ")),
+				})
 			}
+			for _, uf := range uniqueFields {
+				constraints = append(constraints, constraint{fmt.Sprintf("  UNIQUE (%s)", uf)})
+			}
+			for _, fk := range fkFields {
+				constraints = append(constraints, constraint{
+					fmt.Sprintf("  FOREIGN KEY (%s) REFERENCES %s(%s)", fk.col, fk.refTable, fk.refCol),
+				})
+			}
+			for i, c := range constraints {
+				if i < len(constraints)-1 {
+					g.P(c.line + ",")
+				} else {
+					g.P(c.line)
+				}
+			}
+			g.P(");")
+			g.P()
 		}
 
-		type constraint struct{ line string }
-		var constraints []constraint
-		if len(pkCols) > 0 {
-			constraints = append(constraints, constraint{
-				fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(pkCols, ", ")),
-			})
-		}
-		for _, uf := range uniqueFields {
-			constraints = append(constraints, constraint{fmt.Sprintf("  UNIQUE (%s)", uf)})
-		}
-		for _, fk := range fkFields {
-			constraints = append(constraints, constraint{
-				fmt.Sprintf("  FOREIGN KEY (%s) REFERENCES %s(%s)", fk.col, fk.refTable, fk.refCol),
-			})
-		}
-		for i, c := range constraints {
-			if i < len(constraints)-1 {
-				g.P(c.line + ",")
-			} else {
-				g.P(c.line)
-			}
-		}
-		g.P(");")
-		g.P()
-
-		// Chain Table
+		// ── Chain Table ───────────────────────────────────────────────────────
 		// version is scoped to (key, field_name) — each new entry for a field of a
 		// given record gets MAX(version)+1 for that group, set by the BEFORE INSERT
-		// trigger below. A global BIGSERIAL would leak insert order across all
-		// records and make per-field history harder to read.
+		// trigger below.
 		g.P("CREATE TABLE IF NOT EXISTS chain_", modelName, "s (")
 		g.P("  key TEXT NOT NULL,")
 		g.P("  field_name TEXT NOT NULL,")
@@ -399,7 +414,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		g.P(");")
 		g.P()
 
-		// Per-(key, field_name) version trigger.
+		// ── Per-(key, field_name) version trigger ─────────────────────────────
 		triggerFn := fmt.Sprintf("chain_%ss_set_version", modelName)
 		triggerName := fmt.Sprintf("chain_%ss_set_version_trigger", modelName)
 		chainTable := fmt.Sprintf("chain_%ss", modelName)
@@ -422,53 +437,122 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 		g.P("FOR EACH ROW EXECUTE FUNCTION ", triggerFn, "();")
 		g.P()
 
-		// View
+		// ── View ──────────────────────────────────────────────────────────────
 		g.P("CREATE OR REPLACE VIEW ", modelName, "s AS")
 
-		selects := []string{}
-		joins := []string{}
-
-		chainKeyExpr := sqlCompositeKeyExpr(chainKeyCols(msg))
-
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			colName := string(field.Desc.Name())
-
-			if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
-				selects = append(selects, fmt.Sprintf("p.%s", colName))
-			} else {
-				alias := "c_" + colName
-				joins = append(joins, fmt.Sprintf(
-					"LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON %s = %s.key",
-					modelName, colName, alias, chainKeyExpr, alias))
-				// Chain field_value is TEXT; cast to JSONB so the view column has
-				// the right type for JSON operators (->, ->>, @>, etc.).
-				valueExpr := fmt.Sprintf("%s.field_value", alias)
-				if isJsonStored(field, opts) {
-					valueExpr += "::jsonb"
-				}
-				selects = append(selects, fmt.Sprintf("%s AS %s", valueExpr, colName))
-			}
-
-			if opts.Hashed {
-				hashedName := "hashed_" + colName
-				alias := "c_" + hashedName
-				joins = append(joins, fmt.Sprintf(
-					"LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON %s = %s.key",
-					modelName, hashedName, alias, chainKeyExpr, alias))
-				selects = append(selects, fmt.Sprintf("%s.field_value AS %s", alias, hashedName))
-			}
+		if chainOnly {
+			generateChainOnlyView(g, msg, modelName)
+		} else {
+			generatePiiBackedView(g, msg, modelName)
 		}
 
-		g.P("  SELECT")
-		g.P("    ", strings.Join(selects, ",\n    "))
-		g.P("  FROM pii_", modelName, "s p")
-		for _, join := range joins {
-			g.P("  ", join)
-		}
-		g.P(";")
 		g.P()
 	}
+}
+
+// generatePiiBackedView emits the SQL view for messages that have a PII table.
+// The view anchors on pii_* and left-joins chain fields.
+func generatePiiBackedView(g *protogen.GeneratedFile, msg *protogen.Message, modelName string) {
+	selects := []string{}
+	joins := []string{}
+
+	chainKeyExpr := sqlCompositeKeyExpr(chainKeyCols(msg), "p")
+
+	for _, field := range msg.Fields {
+		opts := getFieldOptions(field)
+		colName := string(field.Desc.Name())
+
+		if opts.PrimaryKey || opts.Pii || opts.QueryIndex || opts.References != "" {
+			selects = append(selects, fmt.Sprintf("p.%s", colName))
+		} else {
+			alias := "c_" + colName
+			joins = append(joins, fmt.Sprintf(
+				"LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON %s = %s.key",
+				modelName, colName, alias, chainKeyExpr, alias))
+			valueExpr := fmt.Sprintf("%s.field_value", alias)
+			if isJsonStored(field, opts) {
+				valueExpr += "::jsonb"
+			}
+			selects = append(selects, fmt.Sprintf("%s AS %s", valueExpr, colName))
+		}
+
+		if opts.Hashed {
+			hashedName := "hashed_" + colName
+			alias := "c_" + hashedName
+			joins = append(joins, fmt.Sprintf(
+				"LEFT JOIN (SELECT DISTINCT ON (key, field_name) field_value, key FROM chain_%ss WHERE field_name='%s' ORDER BY key, field_name, version DESC) %s ON %s = %s.key",
+				modelName, hashedName, alias, chainKeyExpr, alias))
+			selects = append(selects, fmt.Sprintf("%s.field_value AS %s", alias, hashedName))
+		}
+	}
+
+	g.P("  SELECT")
+	g.P("    ", strings.Join(selects, ",\n    "))
+	g.P("  FROM pii_", modelName, "s p")
+	for _, join := range joins {
+		g.P("  ", join)
+	}
+	g.P(";")
+}
+
+// generateChainOnlyView emits the SQL view for messages with no PII table.
+// The anchor is SELECT DISTINCT key FROM chain_*, and every field (including
+// the chain_identifier_key itself, returned as keys.key) is a left-joined
+// subquery. References fields carry a SQL comment noting the intended FK since
+// no database-level constraint is possible without a PII anchor table.
+func generateChainOnlyView(g *protogen.GeneratedFile, msg *protogen.Message, modelName string) {
+	selects := []string{}
+	joins := []string{}
+
+	for _, field := range msg.Fields {
+		opts := getFieldOptions(field)
+		colName := string(field.Desc.Name())
+
+		if opts.ChainIdentifierKey {
+			// The key field maps directly from the anchor — no subquery needed.
+			selects = append(selects, fmt.Sprintf("keys.key AS %s", colName))
+			continue
+		}
+
+		alias := "c_" + colName
+		joins = append(joins, fmt.Sprintf(
+			"LEFT JOIN (SELECT DISTINCT ON (key) key, field_value FROM chain_%ss WHERE field_name = '%s' ORDER BY key, version DESC) %s ON keys.key = %s.key",
+			modelName, colName, alias, alias))
+
+		valueExpr := fmt.Sprintf("%s.field_value", alias)
+		if isJsonStored(field, opts) {
+			valueExpr += "::jsonb"
+		}
+
+		comment := ""
+		if opts.References != "" {
+			comment = fmt.Sprintf(" -- references %s", opts.References)
+		}
+		selects = append(selects, fmt.Sprintf("%s AS %s%s", valueExpr, colName, comment))
+
+		if opts.Hashed {
+			hashedName := "hashed_" + colName
+			hashedAlias := "c_" + hashedName
+			joins = append(joins, fmt.Sprintf(
+				"LEFT JOIN (SELECT DISTINCT ON (key) key, field_value FROM chain_%ss WHERE field_name = '%s' ORDER BY key, version DESC) %s ON keys.key = %s.key",
+				modelName, hashedName, hashedAlias, hashedAlias))
+			selects = append(selects, fmt.Sprintf("%s.field_value AS %s", hashedAlias, hashedName))
+		}
+	}
+
+	// tx_hash — latest chain entry's hash for any field.
+	joins = append(joins, fmt.Sprintf(
+		"LEFT JOIN (SELECT DISTINCT ON (key) key, tx_hash FROM chain_%ss ORDER BY key, version DESC) c_tx ON keys.key = c_tx.key",
+		modelName))
+	selects = append(selects, "c_tx.tx_hash")
+
+	g.P("  SELECT")
+	g.P("    ", strings.Join(selects, ",\n    "))
+	g.P("  FROM (SELECT DISTINCT key FROM chain_", modelName, "s) keys")
+	for _, join := range joins {
+		g.P("  ", join)
+	}
+	g.P(";")
 }
 
 func generateRepo(gen *protogen.Plugin, file *protogen.File) {
@@ -491,6 +575,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 	}
 	needDatatypes := fileHasPiiStringJsonField(file)
 	needProtojson := fileHasChainMessageField(file)
+	needStringsJoin := fileHasRepeatedMessageField(file)
 
 	g.P("// Code generated by sdm. DO NOT EDIT.")
 	g.P()
@@ -505,10 +590,11 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P(`	"encoding/hex"`)
 	}
 	g.P(`	"fmt"`)
-	// "strings" not imported here — pgArrayLiteral lives in sdm_helpers.go,
-	// generated once per package by GenerateHelpers to avoid redeclaration errors.
 	if needProtojson {
 		g.P(`	"google.golang.org/protobuf/encoding/protojson"`)
+	}
+	if needStringsJoin {
+		g.P(`	"strings"`)
 	}
 	if needDatatypes {
 		g.P(`	"gorm.io/datatypes"`)
@@ -523,6 +609,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			continue
 		}
 		modelName := msg.GoIdent.GoName
+		chainOnly := isChainOnly(msg)
 
 		// Repo struct
 		g.P("type ", modelName, "Repo struct {")
@@ -535,19 +622,8 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// collect all PK fields — needed by Fetch, Exists, and their param lists.
-		var pkFields []*protogen.Field
-		for _, field := range msg.Fields {
-			if getFieldOptions(field).PrimaryKey {
-				pkFields = append(pkFields, field)
-			}
-		}
-
 		// compositeKeyExpr is the Go expression that produces the chain key string.
-		// Uses chain_identifier_key fields if annotated (e.g. user_id UUID), else PKs.
-		// Using a UUID keeps chain keys stable and opaque even when the PK is an
-		// auto-incremented integer that could leak insertion order.
-		// Must stay in sync with sqlCompositeKeyExpr used in the SQL view.
+		// Uses chain_identifier_key fields if annotated (e.g. ptt_id), else PKs.
 		keyFields := chainKeyGoFields(msg)
 		var compositeKeyExpr string
 		if len(keyFields) == 1 {
@@ -563,30 +639,52 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 				strings.Join(fmtParts, ":"), strings.Join(argParts, ", "))
 		}
 
-		// emitMessageJsonMarshals pre-computes []byte for any chain-stored message
-		// fields. The chain table's field_value is TEXT, so we serialize manually
-		// here; for PII-table message fields GORM does this via the protojson
-		// serializer registered in sdm_helpers.go.
+		// emitMessageJsonMarshals pre-computes []byte for chain-stored message fields.
+		// Singular: protojson.Marshal directly.
+		// Repeated: marshal each element, join into a JSON array string.
 		emitMessageJsonMarshals := func(accept func(*protogen.Field, SdmOptions) bool) {
 			for _, field := range msg.Fields {
 				opts := getFieldOptions(field)
-				if !needsProtojsonMarshal(field) || !accept(field, opts) {
+				if !accept(field, opts) {
 					continue
 				}
 				varName := jsonVarName(field)
-				g.P("    var ", varName, " []byte")
-				g.P("    if model.", field.GoName, " != nil {")
-				g.P("      _b, err := protojson.Marshal(model.", field.GoName, ")")
-				g.P("      if err != nil { return err }")
-				g.P("      ", varName, " = _b")
-				g.P("    }")
+				if needsProtojsonMarshal(field) {
+					g.P("    var ", varName, " []byte")
+					g.P("    if model.", field.GoName, " != nil {")
+					g.P("      _b, err := protojson.Marshal(model.", field.GoName, ")")
+					g.P("      if err != nil { return err }")
+					g.P("      ", varName, " = _b")
+					g.P("    }")
+				} else if needsRepeatedProtojsonMarshal(field) {
+					g.P("    var ", varName, " []byte")
+					g.P("    if len(model.", field.GoName, ") > 0 {")
+					g.P("      _parts := make([]string, 0, len(model.", field.GoName, "))")
+					g.P("      for _, _item := range model.", field.GoName, " {")
+					g.P("        _b, err := protojson.Marshal(_item)")
+					g.P("        if err != nil { return err }")
+					g.P("        _parts = append(_parts, string(_b))")
+					g.P("      }")
+					g.P("      ", varName, " = []byte(\"[\" + strings.Join(_parts, \",\") + \"]\")")
+					g.P("    }")
+				}
 			}
 		}
 
-		chainAccept := func(field *protogen.Field, opts SdmOptions) bool {
-			// References fields live in the PII table (the FK is on the PII column);
-			// don't double-record them in the chain.
-			return !opts.PrimaryKey && !opts.Pii && opts.References == ""
+		// chainAccept decides which fields go into the chain table.
+		// For PII-backed messages: skip PK, PII, and references fields (those live in PII).
+		// For chain-only messages: skip only the chain identifier key itself (it IS the key,
+		// not a field_value row); references fields have no PII table to live in, so they
+		// go into chain too.
+		var chainAccept func(*protogen.Field, SdmOptions) bool
+		if chainOnly {
+			chainAccept = func(field *protogen.Field, opts SdmOptions) bool {
+				return !opts.ChainIdentifierKey
+			}
+		} else {
+			chainAccept = func(field *protogen.Field, opts SdmOptions) bool {
+				return !opts.PrimaryKey && !opts.Pii && opts.References == ""
+			}
 		}
 
 		emitPiiStruct := func() {
@@ -597,10 +695,6 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 					if opts.AutoIncrement {
 						continue
 					}
-					// PII struct field types match the Go shape: *Message for nested
-					// proto messages (GORM serializes via the protojson serializer);
-					// datatypes.JSON for string + (sdm.json)=true (cheap []byte cast);
-					// scalar for everything else.
 					switch {
 					case needsProtojsonMarshal(field):
 						g.P("      ", field.GoName, ": model.", field.GoName, ",")
@@ -619,36 +713,45 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			emitMessageJsonMarshals(chainAccept)
 			for _, field := range msg.Fields {
 				opts := getFieldOptions(field)
-				if opts.PrimaryKey {
+				// Skip the key field itself — it's the chain row's key, not a field_value entry.
+				if chainOnly && opts.ChainIdentifierKey {
 					continue
 				}
-				if opts.References != "" {
-					continue // references field is in PII, not chain
-				}
-				if !opts.Pii {
-					// FIX: repeated fields must be serialised as a PG array literal.
-					// fmt.Sprintf("%v", []string{"A","B"}) → "[A B]" which is invalid SQL.
-					// pgArrayLiteral produces "{A,B}" which PostgreSQL accepts as text[].
-					// JSON fields are datatypes.JSON ([]byte) — fmt %v would render the
-					// byte slice as "[123 34 …]", so we cast to string to preserve the
-					// JSON text exactly.
-					var fieldValueExpr string
-					switch {
-					case needsProtojsonMarshal(field):
-						fieldValueExpr = fmt.Sprintf("string(%s)", jsonVarName(field))
-					case opts.Json:
-						fieldValueExpr = fmt.Sprintf("string(model.%s)", field.GoName)
-					case field.Desc.IsList():
-						fieldValueExpr = fmt.Sprintf("pgArrayLiteral(model.%s)", field.GoName)
-					default:
-						fieldValueExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", model.%s)", field.GoName)
+				// For PII-backed: skip PK, PII, and references (those live in PII table).
+				if !chainOnly {
+					if opts.PrimaryKey {
+						continue
 					}
-					g.P("    if err := tx.Create(&", modelName, "Chain{")
-					g.P("      Key:        compositeKey,")
-					g.P("      FieldName:  \"", field.Desc.Name(), "\",")
-					g.P("      FieldValue: ", fieldValueExpr, ",")
-					g.P("    }).Error; err != nil { return err }")
+					if opts.References != "" {
+						continue
+					}
+					if opts.Pii {
+						continue
+					}
 				}
+
+				var fieldValueExpr string
+				switch {
+				case needsProtojsonMarshal(field):
+					// Singular proto.Message → pre-marshaled by emitMessageJsonMarshals.
+					fieldValueExpr = fmt.Sprintf("string(%s)", jsonVarName(field))
+				case needsRepeatedProtojsonMarshal(field):
+					// Repeated proto.Message → JSON array pre-built by emitMessageJsonMarshals.
+					fieldValueExpr = fmt.Sprintf("string(%s)", jsonVarName(field))
+				case opts.Json:
+					fieldValueExpr = fmt.Sprintf("string(model.%s)", field.GoName)
+				case field.Desc.IsList():
+					// Repeated scalar ([]string) → PostgreSQL array literal.
+					fieldValueExpr = fmt.Sprintf("pgArrayLiteral(model.%s)", field.GoName)
+				default:
+					fieldValueExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", model.%s)", field.GoName)
+				}
+				g.P("    if err := tx.Create(&", modelName, "Chain{")
+				g.P("      Key:        compositeKey,")
+				g.P("      FieldName:  \"", field.Desc.Name(), "\",")
+				g.P("      FieldValue: ", fieldValueExpr, ",")
+				g.P("    }).Error; err != nil { return err }")
+
 				if opts.Hashed {
 					g.P("    // Hash ", field.GoName)
 					g.P("    h_", field.GoName, " := sha256.Sum256([]byte(fmt.Sprintf(\"%v\", model.", field.GoName, ")))")
@@ -671,18 +774,20 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			}
 		}
 
-		// ── SavePii ──────────────────────────────────────────────────────────────
-		g.P("func (r *", modelName, "Repo) SavePii(ctx context.Context, model *", modelName, ") error {")
-		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
-		emitPiiStruct()
-		g.P("    if err := tx.Create(&pii).Error; err != nil { return err }")
-		emitAutoIncrementCopyback()
-		g.P("    return nil")
-		g.P("  })")
-		g.P("}")
-		g.P()
+		// ── SavePii (PII-backed only) ─────────────────────────────────────────
+		if !chainOnly {
+			g.P("func (r *", modelName, "Repo) SavePii(ctx context.Context, model *", modelName, ") error {")
+			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
+			emitPiiStruct()
+			g.P("    if err := tx.Create(&pii).Error; err != nil { return err }")
+			emitAutoIncrementCopyback()
+			g.P("    return nil")
+			g.P("  })")
+			g.P("}")
+			g.P()
+		}
 
-		// ── SaveChain ────────────────────────────────────────────────────────────
+		// ── SaveChain ─────────────────────────────────────────────────────────
 		g.P("func (r *", modelName, "Repo) SaveChain(ctx context.Context, model *", modelName, ") error {")
 		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 		g.P("    // Save Chain Fields")
@@ -692,13 +797,15 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// ── Save ─────────────────────────────────────────────────────────────────
+		// ── Save ──────────────────────────────────────────────────────────────
 		g.P("func (r *", modelName, "Repo) Save(ctx context.Context, model *", modelName, ") error {")
 		g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
-		emitPiiStruct()
-		g.P("    if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pii).Error; err != nil { return err }")
-		emitAutoIncrementCopyback()
-		g.P()
+		if !chainOnly {
+			emitPiiStruct()
+			g.P("    if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pii).Error; err != nil { return err }")
+			emitAutoIncrementCopyback()
+			g.P()
+		}
 		g.P("    // Save Chain Fields")
 		emitChainEntries()
 		g.P("    return nil")
@@ -706,92 +813,143 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		g.P("}")
 		g.P()
 
-		// build WHERE clause params once — shared by Fetch and Exists.
-		fetchParams := make([]string, len(pkFields))
-		whereExprs := make([]string, len(pkFields))
-		whereArgs := make([]string, len(pkFields))
-		for i, f := range pkFields {
-			paramName := strings.ToLower(f.GoName[:1]) + f.GoName[1:]
-			fetchParams[i] = paramName + " " + goTypeForField(f)
-			whereExprs[i] = string(f.Desc.Name()) + " = ?"
-			whereArgs[i] = paramName
-		}
+		// ── Fetch / FetchBy* / Exists / ExistsBy* ────────────────────────────
+		// For chain-only messages the identifier is the chain key field, not a PK.
+		// For PII-backed messages the identifier is the PK field(s).
+		if chainOnly {
+			// Single key field — chain_identifier_key is always the lookup handle.
+			keyField := keyFields[0]
+			paramName := strings.ToLower(keyField.GoName[:1]) + keyField.GoName[1:]
+			paramType := goTypeForField(keyField)
+			colName := string(keyField.Desc.Name())
 
-		// ── Fetch ────────────────────────────────────────────────────────────────
-		g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ",
-			strings.Join(fetchParams, ", "), ") (*", modelName, "View, error) {")
-		g.P("  var view ", modelName, "View")
-		g.P("  if err := r.db.WithContext(ctx).Where(\"", strings.Join(whereExprs, " AND "), "\", ",
-			strings.Join(whereArgs, ", "), ").First(&view).Error; err != nil {")
-		g.P("    return nil, err")
-		g.P("  }")
-		g.P("  return &view, nil")
-		g.P("}")
-		g.P()
-
-		// ── FetchBy{UniqueField} ─────────────────────────────────────────────────
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			if !opts.Unique {
-				continue
-			}
-			paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
-			g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
-				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (*", modelName, "View, error) {")
+			// Fetch queries the view by the chain key column (materialized as keys.key AS ptt_id).
+			g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ", paramName, " ", paramType, ") (*", modelName, "View, error) {")
 			g.P("  var view ", modelName, "View")
-			g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").First(&view).Error; err != nil {")
+			g.P("  if err := r.db.WithContext(ctx).Where(\"", colName, " = ?\", ", paramName, ").First(&view).Error; err != nil {")
 			g.P("    return nil, err")
 			g.P("  }")
 			g.P("  return &view, nil")
 			g.P("}")
 			g.P()
-		}
 
-		// ── FetchBy{PkField} (composite PK only) ────────────────────────────────
-		if len(pkFields) > 1 {
-			for _, field := range pkFields {
-				paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
-				g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
-					"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") ([]", modelName, "View, error) {")
-				g.P("  var views []", modelName, "View")
-				g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").Find(&views).Error; err != nil {")
-				g.P("    return nil, err")
-				g.P("  }")
-				g.P("  return views, nil")
-				g.P("}")
-				g.P()
-			}
-		}
-
-		// ── Exists ───────────────────────────────────────────────────────────────
-		g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ",
-			strings.Join(fetchParams, ", "), ") (bool, error) {")
-		g.P("  var count int64")
-		g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
-			strings.Join(whereExprs, " AND "), "\", ", strings.Join(whereArgs, ", "), ").Count(&count).Error; err != nil {")
-		g.P("    return false, err")
-		g.P("  }")
-		g.P("  return count > 0, nil")
-		g.P("}")
-		g.P()
-
-		// ── ExistsBy{UniqueField} ────────────────────────────────────────────────
-		for _, field := range msg.Fields {
-			opts := getFieldOptions(field)
-			if !opts.Unique {
-				continue
-			}
-			paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
-			g.P("func (r *", modelName, "Repo) ExistsBy", field.GoName,
-				"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (bool, error) {")
+			// Exists queries the chain table directly — no PII table available.
+			g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ", paramName, " ", paramType, ") (bool, error) {")
 			g.P("  var count int64")
-			g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
-				field.Desc.Name(), " = ?\", ", paramName, ").Count(&count).Error; err != nil {")
+			g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Chain{}).Where(\"key = ?\", ", paramName, ").Count(&count).Error; err != nil {")
 			g.P("    return false, err")
 			g.P("  }")
 			g.P("  return count > 0, nil")
 			g.P("}")
 			g.P()
+
+			// FetchBy* for unique non-key fields.
+			for _, field := range msg.Fields {
+				opts := getFieldOptions(field)
+				if !opts.Unique || opts.ChainIdentifierKey {
+					continue
+				}
+				fp := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+				g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
+					"(ctx context.Context, ", fp, " ", goTypeForField(field), ") (*", modelName, "View, error) {")
+				g.P("  var view ", modelName, "View")
+				g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", fp, ").First(&view).Error; err != nil {")
+				g.P("    return nil, err")
+				g.P("  }")
+				g.P("  return &view, nil")
+				g.P("}")
+				g.P()
+			}
+		} else {
+			// PII-backed path — unchanged from original.
+			var pkFields []*protogen.Field
+			for _, field := range msg.Fields {
+				if getFieldOptions(field).PrimaryKey {
+					pkFields = append(pkFields, field)
+				}
+			}
+
+			fetchParams := make([]string, len(pkFields))
+			whereExprs := make([]string, len(pkFields))
+			whereArgs := make([]string, len(pkFields))
+			for i, f := range pkFields {
+				paramName := strings.ToLower(f.GoName[:1]) + f.GoName[1:]
+				fetchParams[i] = paramName + " " + goTypeForField(f)
+				whereExprs[i] = string(f.Desc.Name()) + " = ?"
+				whereArgs[i] = paramName
+			}
+
+			g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ",
+				strings.Join(fetchParams, ", "), ") (*", modelName, "View, error) {")
+			g.P("  var view ", modelName, "View")
+			g.P("  if err := r.db.WithContext(ctx).Where(\"", strings.Join(whereExprs, " AND "), "\", ",
+				strings.Join(whereArgs, ", "), ").First(&view).Error; err != nil {")
+			g.P("    return nil, err")
+			g.P("  }")
+			g.P("  return &view, nil")
+			g.P("}")
+			g.P()
+
+			for _, field := range msg.Fields {
+				opts := getFieldOptions(field)
+				if !opts.Unique {
+					continue
+				}
+				paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+				g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
+					"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (*", modelName, "View, error) {")
+				g.P("  var view ", modelName, "View")
+				g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").First(&view).Error; err != nil {")
+				g.P("    return nil, err")
+				g.P("  }")
+				g.P("  return &view, nil")
+				g.P("}")
+				g.P()
+			}
+
+			if len(pkFields) > 1 {
+				for _, field := range pkFields {
+					paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+					g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
+						"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") ([]", modelName, "View, error) {")
+					g.P("  var views []", modelName, "View")
+					g.P("  if err := r.db.WithContext(ctx).Where(\"", field.Desc.Name(), " = ?\", ", paramName, ").Find(&views).Error; err != nil {")
+					g.P("    return nil, err")
+					g.P("  }")
+					g.P("  return views, nil")
+					g.P("}")
+					g.P()
+				}
+			}
+
+			g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ",
+				strings.Join(fetchParams, ", "), ") (bool, error) {")
+			g.P("  var count int64")
+			g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
+				strings.Join(whereExprs, " AND "), "\", ", strings.Join(whereArgs, ", "), ").Count(&count).Error; err != nil {")
+			g.P("    return false, err")
+			g.P("  }")
+			g.P("  return count > 0, nil")
+			g.P("}")
+			g.P()
+
+			for _, field := range msg.Fields {
+				opts := getFieldOptions(field)
+				if !opts.Unique {
+					continue
+				}
+				paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+				g.P("func (r *", modelName, "Repo) ExistsBy", field.GoName,
+					"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (bool, error) {")
+				g.P("  var count int64")
+				g.P("  if err := r.db.WithContext(ctx).Model(&", modelName, "Pii{}).Where(\"",
+					field.Desc.Name(), " = ?\", ", paramName, ").Count(&count).Error; err != nil {")
+				g.P("    return false, err")
+				g.P("  }")
+				g.P("  return count > 0, nil")
+				g.P("}")
+				g.P()
+			}
 		}
 	}
 }
@@ -855,11 +1013,17 @@ func isJsonStored(field *protogen.Field, opts SdmOptions) bool {
 	return opts.Json || field.Desc.Kind() == protoreflect.MessageKind
 }
 
-// needsProtojsonMarshal reports whether converting model.X → datatypes.JSON
-// requires protojson.Marshal (returns []byte, error) rather than a cheap
-// string→[]byte conversion.
+// needsProtojsonMarshal reports whether a singular (non-list) message-kind field
+// requires protojson.Marshal. Repeated message fields are handled separately by
+// needsRepeatedProtojsonMarshal — they are slices, not proto.Message values.
 func needsProtojsonMarshal(field *protogen.Field) bool {
-	return field.Desc.Kind() == protoreflect.MessageKind
+	return field.Desc.Kind() == protoreflect.MessageKind && !field.Desc.IsList()
+}
+
+// needsRepeatedProtojsonMarshal reports whether a repeated message-kind field
+// requires element-wise protojson marshaling into a JSON array string.
+func needsRepeatedProtojsonMarshal(field *protogen.Field) bool {
+	return field.Desc.Kind() == protoreflect.MessageKind && field.Desc.IsList()
 }
 
 // jsonVarName produces the local variable name used to hold the marshaled JSON
@@ -869,13 +1033,11 @@ func jsonVarName(field *protogen.Field) string {
 }
 
 // goTypeForField maps proto field kinds to Go types.
-//   - Message-kind fields → typed *MessageName pointer (GORM uses protojson serializer)
-//   - (sdm.json)=true string fields → datatypes.JSON (raw bytes)
-//   - repeated fields → []string / []int64 on the domain model and repo params;
-//     the View struct uses pq.StringArray directly in generateMessageModels
-//   - scalars → string / int64
 func goTypeForField(field *protogen.Field) string {
 	if field.Desc.Kind() == protoreflect.MessageKind {
+		if field.Desc.IsList() {
+			return "[]*" + field.Message.GoIdent.GoName
+		}
 		return "*" + field.Message.GoIdent.GoName
 	}
 	if getFieldOptions(field).Json {
@@ -899,7 +1061,6 @@ func goTypeForField(field *protogen.Field) string {
 
 // sqlTypeForField emits BIGSERIAL for auto_increment fields, JSONB for
 // json-stored fields (annotated or message-kind), TEXT/BIGINT otherwise.
-// Repeated fields are chain-only and never appear in the PII table.
 func sqlTypeForField(field *protogen.Field, opts SdmOptions) string {
 	if opts.AutoIncrement {
 		return "BIGSERIAL"
@@ -918,8 +1079,7 @@ func sqlTypeForField(field *protogen.Field, opts SdmOptions) string {
 }
 
 // fileHasStringJsonField reports whether any string field is annotated with
-// (sdm.json)=true — that's the only case where the generated Go references
-// datatypes.JSON (message-kind fields use a typed pointer instead).
+// (sdm.json)=true.
 func fileHasStringJsonField(file *protogen.File) bool {
 	for _, msg := range file.Messages {
 		if !isSdmRecord(msg) {
@@ -952,8 +1112,7 @@ func fileHasMessageJsonField(file *protogen.File) bool {
 }
 
 // fileHasChainMessageField reports whether any chain-stored (non-PII, non-PK)
-// field is a nested proto message — drives the protojson import in the repo
-// file, since chain entries marshal manually into the TEXT field_value column.
+// field is a nested proto message.
 func fileHasChainMessageField(file *protogen.File) bool {
 	for _, msg := range file.Messages {
 		if !isSdmRecord(msg) {
@@ -972,11 +1131,34 @@ func fileHasChainMessageField(file *protogen.File) bool {
 	return false
 }
 
+// fileHasRepeatedMessageField reports whether any chain-stored field is a
+// repeated message — drives the "strings" import in the repo file for the
+// strings.Join call in the element-wise JSON array marshaling loop.
+func fileHasRepeatedMessageField(file *protogen.File) bool {
+	for _, msg := range file.Messages {
+		if !isSdmRecord(msg) {
+			continue
+		}
+		for _, field := range msg.Fields {
+			if needsRepeatedProtojsonMarshal(field) {
+				opts := getFieldOptions(field)
+				if chainAcceptDefault(opts) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// chainAcceptDefault is the chain-only accept predicate used outside a per-message
+// closure — it matches the same logic as the chain-only chainAccept inside generateRepo.
+func chainAcceptDefault(opts SdmOptions) bool {
+	return !opts.ChainIdentifierKey
+}
+
 // fileHasPiiStringJsonField reports whether any PII-routed string field is
-// annotated (sdm.json)=true. That's the only place the repo file references
-// datatypes.JSON — the PII struct literal casts model.X (string) to JSONB
-// bytes. Chain entries use a plain string→string conversion, so they don't
-// pull in datatypes.
+// annotated (sdm.json)=true.
 func fileHasPiiStringJsonField(file *protogen.File) bool {
 	for _, msg := range file.Messages {
 		if !isSdmRecord(msg) {
@@ -992,15 +1174,30 @@ func fileHasPiiStringJsonField(file *protogen.File) bool {
 	return false
 }
 
-// isSdmRecord reports whether a message should produce SDM tables (PII/chain/
-// view + repo). A record needs at least one primary_key field — value-type
-// messages (e.g. `Money { value, unit }` used inline as JSON) have none and
-// must be skipped to avoid empty CREATE TABLE statements and broken views.
+// isSdmRecord reports whether a message should produce SDM tables.
+// A record needs at least one primary_key OR chain_identifier_key field.
+// Value-type messages (e.g. Money, RequiredDocument) used inline as JSON have
+// neither and are skipped to avoid empty tables and broken views.
 func isSdmRecord(msg *protogen.Message) bool {
 	for _, field := range msg.Fields {
-		if getFieldOptions(field).PrimaryKey {
+		opts := getFieldOptions(field)
+		if opts.PrimaryKey || opts.ChainIdentifierKey {
 			return true
 		}
 	}
 	return false
+}
+
+// isChainOnly reports whether a message has no PII-routed fields (no primary_key,
+// no pii-annotated fields). For chain-only messages the generator skips the PII
+// table, SavePii, and FK constraints, and emits a pivot view over chain_* instead
+// of a join-based view anchored on pii_*.
+func isChainOnly(msg *protogen.Message) bool {
+	for _, field := range msg.Fields {
+		opts := getFieldOptions(field)
+		if opts.PrimaryKey || opts.Pii {
+			return false
+		}
+	}
+	return true
 }
