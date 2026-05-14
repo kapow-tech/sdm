@@ -210,6 +210,11 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 				g.P(field.GoName, " ", goType, " `gorm:\"", tag, "\"`")
 			}
 		}
+		// Audit columns — always present on every PII table.
+		// DeletedAt uses gorm.DeletedAt so GORM's soft-delete scope applies automatically.
+		g.P("CreatedAt time.Time `gorm:\"column:created_at\"`")
+		g.P("UpdatedAt time.Time `gorm:\"column:updated_at\"`")
+		g.P("DeletedAt gorm.DeletedAt `gorm:\"column:deleted_at\"`")
 		g.P("}")
 		g.P()
 	}
@@ -377,6 +382,12 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 				}
 			}
 
+			// Audit columns — always present on every PII table.
+			// deleted_at is nullable: NULL means the row is live; non-NULL means soft-deleted.
+			g.P("  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,")
+			g.P("  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,")
+			g.P("  deleted_at TIMESTAMP NULL,")
+
 			type constraint struct{ line string }
 			var constraints []constraint
 			if len(pkCols) > 0 {
@@ -489,6 +500,19 @@ func generatePiiBackedView(g *protogen.GeneratedFile, msg *protogen.Message, mod
 			selects = append(selects, fmt.Sprintf("%s.field_value AS %s", alias, hashedName))
 		}
 	}
+
+	// Always expose PII audit columns in the view.
+	// is_deleted is computed from deleted_at so callers get a simple bool and
+	// GORM soft-delete queries (WHERE deleted_at IS NULL) work against the view.
+	selects = append(selects, "p.created_at")
+	selects = append(selects, "p.updated_at")
+	selects = append(selects, "p.deleted_at IS NOT NULL AS is_deleted")
+
+	// Latest tx_hash from the chain table for this record.
+	joins = append(joins, fmt.Sprintf(
+		"LEFT JOIN (SELECT DISTINCT ON (key) key, tx_hash FROM chain_%ss ORDER BY key, version DESC) c_tx ON %s = c_tx.key",
+		modelName, chainKeyExpr))
+	selects = append(selects, "c_tx.tx_hash")
 
 	g.P("  SELECT")
 	g.P("    ", strings.Join(selects, ",\n    "))
