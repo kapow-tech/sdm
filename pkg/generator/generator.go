@@ -258,6 +258,10 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 			g.P("Hashed", field.GoName, " string `gorm:\"column:hashed_", field.Desc.Name(), "\"`")
 		}
 	}
+	// Audit columns surfaced from the PII table on the view.
+	g.P("CreatedAt time.Time `gorm:\"column:created_at\"`")
+	g.P("UpdatedAt time.Time `gorm:\"column:updated_at\"`")
+	g.P("IsDeleted bool `gorm:\"column:is_deleted\"`")
 	g.P("TxHash string `gorm:\"column:tx_hash\"`")
 	g.P("}")
 	g.P()
