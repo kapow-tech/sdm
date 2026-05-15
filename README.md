@@ -1,146 +1,242 @@
 # Sensitive Data Management (SDM)
 
-* Usage example [here](https://github.com/jinuthankachan/sdm-examples)
+SDM is a Go toolset for separating sensitive data (PII) from append-only chain
+data using Protobuf annotations. From a single annotated `.proto` file it
+generates:
 
-SDM is a toolset for Golang projects to manage sensitive data (PII) by separating it from public chain data using Protobuf annotations. It automatically generates Go models, SQL schemas, and Repository functions to handle the data flow.
+- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`)
+- PostgreSQL DDL (PII table, chain table, combined view, version trigger)
+- A type-safe repository (`Save`, `SavePii`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`)
+
+A runnable end-to-end demo lives at
+[sdm-tool/sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
 
 ## Features
 
-*   **Proto Annotations**: Define `primary_key`, `pii`, `hashed`, etc., directly in your `.proto` files.
-*   **Auto-Generated Go Models**: Creates GORM-compatible structs for PII tables, Chain tables, and combined Views.
-*   **Auto-Generated SQL**: Generates `CREATE TABLE` and `CREATE VIEW` statements for PostgreSQL.
-*   **Auto-Generated Repositories**: Generates type-safe `Save` and `Fetch` methods that handle:
-    *   Splitting data into PII and Chain tables.
-    *   Hashing fields marked as `hashed`.
-    *   Reconstructing objects from the DB View.
-*   **Integrated Toolchain**: The `sdm` CLI manages dependencies, setup, and generation, acting as a wrapper around standard tools like `buf` and `protoc`.
+### Field annotations (`sdmprotos/annotations.proto`)
+
+| Annotation | Effect |
+|---|---|
+| `(sdm.primary_key) = true` | Column is the PII table primary key. |
+| `(sdm.auto_increment) = true` | Generates `BIGSERIAL` in SQL and `autoIncrement` GORM tag; assigned value is copied back to the model on Save. |
+| `(sdm.chain_identifier_key) = true` | Field's value is used as the chain table key (defaults to the PK if absent). Lets you use an opaque `user_id` string while the PK stays a numeric `id`. |
+| `(sdm.pii) = true` | Column lives in `pii_{name}s` (sensitive, single row per record). |
+| `(sdm.query_index) = true` | Column lives in PII for indexed lookups (no `pii` flag needed). |
+| `(sdm.hashed) = true` | Adds a `hashed_{field}` chain row containing `sha256(value)`. Combines freely with `pii`. |
+| `(sdm.unique) = true` | Emits a SQL `UNIQUE` constraint **and** generates `FetchBy{Field}` / `ExistsBy{Field}` methods. |
+| `(sdm.references) = "Type.field"` | Emits a foreign key. The referenced field must be `UNIQUE` or `PRIMARY KEY`. Reference fields are placed in the PII table. |
+| `(sdm.json) = true` | String field stored as Postgres `JSONB`; Go side uses `datatypes.JSON`. |
+
+### Type handling
+
+| Proto type | PII Go type | Chain serialization | View Go type |
+|---|---|---|---|
+| `string`, `int32`, `int64`, `bool` | Native | `fmt.Sprintf("%v", …)` | Native |
+| `string` + `(sdm.json) = true` | `datatypes.JSON` | Raw JSON text | `datatypes.JSON` |
+| Nested `MessageType` | `*MessageType` (with `serializer:protojson`) | `protojson.Marshal(...)` | `*MessageType` (auto-decoded by serializer) |
+| `repeated string` | (not allowed in PII) | `pgArrayLiteral` → `{a,b,c}` | `pq.StringArray` (`text[]`) |
+| `repeated MessageType` | (not allowed in PII) | JSON array, element-wise protojson | `datatypes.JSON` (`jsonb`) |
+
+### Baked-in audit + soft-delete
+
+Every PII table receives three columns by default:
+
+```sql
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+deleted_at TIMESTAMP WITH TIME ZONE NULL,
+```
+
+The generated PII and View structs carry these as `time.Time` / `gorm.DeletedAt`.
+`db.Delete(&xPii)` performs soft-delete (sets `deleted_at = NOW()`); all
+generated `Fetch` / `FetchBy{X}` / `Exists` / `ExistsBy{X}` methods append
+an explicit `WHERE deleted_at IS NULL` filter so soft-deleted rows stay
+hidden.
+
+### Chain versioning
+
+The chain table's `(key, field_name, version)` is a composite primary key.
+A `BEFORE INSERT` trigger sets `version = MAX(version) + 1` scoped to
+`(key, field_name)`, so each field's history is a per-(record, field)
+sequence — globally `1, 2, 3 …` per field, not a single sequence across the
+whole table.
 
 ## Installation
 
-1.  **Install the Tool**:
-    ```bash
-    go install github.com/kapow-tech/sdm/cmd/sdm@latest
-    ```
+```bash
+go install github.com/kapow-tech/sdm/cmd/sdm@latest
+```
 
-2. **Configuration**:
+Two more steps put the project on a clean footing:
 
-    Generate a configuration file to manage your project settings.
-
-    ```bash
-    sdm config
-    ```
-    This creates `sdm.cfg.yaml` where you can customize output directories and input proto files.
-
-3.  **Setup the Environment**:
-    Run `sdm setup` to install required dependencies (`protoc-gen-go`, `buf`, `protoc-gen-sdm`), initialize the `buf` module, and download SDM proto definitions.
-    ```bash
-    sdm setup
-    ```
+```bash
+sdm config   # writes sdm.cfg.yaml in the current directory
+sdm setup    # installs protoc-gen-go, buf, protoc-gen-sdm; exports SDM protos
+```
 
 ## Usage
 
-An example can be found at [SDM examples repo](https://github.com/kapow-tech/sdm-examples)
+A complete runnable example is at
+[sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
 
-### 1. Define your Data Model
-
-Create a `.proto` file (e.g., `proto/invoice/invoice.proto`) and import `annotations/annotations.proto`. Annotate your fields:
+### 1. Annotate your `.proto`
 
 ```proto
 syntax = "proto3";
 package invoice;
 
-import "annotations/annotations.proto";
+import "proto/sdmprotos/annotations.proto";
 
-option go_package = "github.com/kapow-tech/sdm/proto/invoice";
+option go_package = "demo/models/invoice";
 
 message Invoice {
-  string id = 1 [(sdm.primary_key) = true, (sdm.chain_identifier_key) = true];
-  int64 invoice_number = 2 [(sdm.pii) = true];
-  string seller_gst = 3 [(sdm.pii) = true, (sdm.hashed) = true];
-  // ...
+  string invoice_id = 1 [(sdm.primary_key) = true, (sdm.chain_identifier_key) = true];
+  string seller_gst = 2 [(sdm.pii) = true, (sdm.hashed) = true];
+  string buyer_gst  = 3 [(sdm.pii) = true, (sdm.hashed) = true];
+  string seller_id  = 4 [(sdm.references) = "User.user_id"];
+  string buyer_id   = 5 [(sdm.references) = "User.user_id"];
+  int64  amount     = 6;
+  string metadata   = 7 [(sdm.json) = true];
+  Money  price      = 8 [(sdm.pii) = true];
+  repeated string tags  = 9;
+  repeated Money  items = 10;
+}
+
+message Money {
+  int64  value = 1;
+  string unit  = 2;
 }
 ```
 
-### 2. Generate Code
+`User` lives in a sibling `user.proto`:
 
-Run the `sdm` tool to generate the artifacts.
-
-```bash
-sdm generate --proto proto/invoice/invoice.proto --out gen_out
+```proto
+message User {
+  int64  id      = 1 [(sdm.primary_key) = true, (sdm.auto_increment) = true];
+  string user_id = 2 [(sdm.pii) = true, (sdm.chain_identifier_key) = true, (sdm.unique) = true];
+  string email   = 3 [(sdm.pii) = true, (sdm.hashed) = true, (sdm.unique) = true];
+  string name    = 5 [(sdm.pii) = true];
+  string pan     = 6 [(sdm.unique) = true];
+  string country = 7;
+}
 ```
 
-Or, if you have configured `sdm.cfg.yaml` with your protos:
+### 2. Generate
+
+With `sdm.cfg.yaml`:
+```yaml
+sdm: "dev"
+sdm-proto: "proto/"
+user-protos:
+  - "proto/user/user.proto"
+  - "proto/invoice/invoice.proto"
+output: "models/"
+output-sql: "models/sql/"
+```
+
 ```bash
 sdm generate
 ```
 
-This will compile the protos using the `sdm` directory (setup by `sdm setup`) as an import path and generate:
-*   `invoice.pb.go`: Standard Protobuf Go code.
-*   `invoice_sdm_model.go`: SDM Structs (`...Pii`, `...Chain`, `...View`).
-*   `invoice_sdm_schema.sql`: SQL DDL for PII, Chain tables and Views.
-*   `invoice_sdm_repo.go`: GORM Repository implementation.
+Per proto, four files are emitted:
+- `{name}.pb.go` — standard protobuf code
+- `{name}_sdm_model.go` — `{Name}Pii`, `{Name}Chain`, `{Name}View` structs
+- `{name}_sdm_schema.sql` — `CREATE TABLE`s, the version trigger, the view
+- `{name}_sdm_repo.go` — GORM repository
+
+A single `sdm_helpers.go` per package holds `pgArrayLiteral` (for repeated
+scalar fields) and the `protojson` GORM serializer (for nested messages).
 
 ### 3. Use in Go
 
 ```go
 import (
     "context"
+    "gorm.io/driver/postgres"
     "gorm.io/gorm"
-    "github.com/kapow-tech/sdm/proto/invoice"
-    // Ensure the annotations package is available if needed, usually implicitly handled by generated code imports
+    "demo/models/invoice"
+    "demo/models/user"
 )
 
-func main() {
-    db, _ := gorm.Open(...) 
-    repo := invoice.NewInvoiceRepo(db)
+db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 
-    // Save (Splits and Hashes automatically)
-    err := repo.Save(ctx, &invoice.Invoice{
-        Id: "inv_123",
-        InvoiceNumber: 1001,
-        SellerGst: "GST001",
-    })
+userRepo := user.NewUserRepo(db)
+userRepo.Save(ctx, &user.User{
+    UserId: "u_001", Email: "alice@example.com", Name: "Alice", Pan: "ABCDE1234F", Country: "IN",
+})
 
-    // Fetch (reconstructs from View)
-    view, err := repo.Fetch(ctx, "inv_123")
-}
+repo := invoice.NewInvoiceRepo(db)
+err := repo.Save(ctx, &invoice.Invoice{
+    InvoiceId: "inv_001",
+    SellerGst: "27AAA…", BuyerGst: "29BBB…",
+    SellerId:  "u_001", BuyerId: "u_002",
+    Amount:    10000,
+    Metadata:  `{"source":"api"}`,
+    Price:     &invoice.Money{Value: 10000, Unit: "INR"},
+    Tags:      []string{"urgent", "paid"},
+    Items:     []*invoice.Money{{Value: 9000, Unit: "INR"}, {Value: 1000, Unit: "INR"}},
+})
+
+view, _ := repo.Fetch(ctx, "inv_001")
+// view.Price is *Money, view.Items is datatypes.JSON, view.Tags is pq.StringArray.
+// view.CreatedAt / view.UpdatedAt / view.DeletedAt are populated automatically.
+
+// Soft-delete via GORM:
+_ = db.Delete(&invoice.InvoicePii{InvoiceId: "inv_001"}).Error
+// Subsequent Fetch / Exists will return ErrRecordNotFound / false.
 ```
 
 ## CLI Reference
 
-*   `sdm setup`: Installs dependencies (`protoc-gen-go`, `buf`, `protoc-gen-sdm`), initializes `buf`, and exports SDM protos to a local `sdm/` directory.
-*   `sdm config`: Generates a default `sdm.cfg.yaml` file.
-*   `sdm generate`: Compiles and generates code.
-    *   `--proto`: Input proto file (optional if defined in config).
-    *   `--out`: Output directory (optional if defined in config).
-    *   `--cfg`: Path to config file (default `sdm.cfg.yaml`).
+| Command | Description |
+|---|---|
+| `sdm setup` | Installs `protoc-gen-go`, `buf`, `protoc-gen-sdm`; exports SDM annotation protos to a local directory. |
+| `sdm config` | Writes a default `sdm.cfg.yaml`. |
+| `sdm generate` | Compiles user protos and writes the four generated files per message. Flags: `--proto`, `--out`, `--cfg` (default `sdm.cfg.yaml`). |
 
-## Using with Buf directly (Not tested enough)
+## Using with buf directly
 
-If you prefer using `buf` directly without the `sdm` wrapper:
+```bash
+go install github.com/kapow-tech/sdm/cmd/protoc-gen-sdm@latest
+```
 
-1.  **Install the plugin**:
-    ```bash
-    go install github.com/kapow-tech/sdm/cmd/protoc-gen-sdm@latest
-    ```
-2.  **Configure `buf.gen.yaml`**:
-    ```yaml
-    version: v1
-    plugins:
-      - plugin: go
-        out: .
-        opt: paths=source_relative
-      - plugin: sdm
-        out: .
-        opt: paths=source_relative
-    ```
-3.  **Generate**:
-    ```bash
-    buf generate
-    ```
+```yaml
+# buf.gen.yaml
+version: v1
+plugins:
+  - plugin: go
+    out: .
+    opt: paths=source_relative
+  - plugin: sdm
+    out: .
+    opt: paths=source_relative
+```
 
-## Generated Schema Structure
+```bash
+buf generate
+```
 
-*   **`pii_<name>s`**: Stores `pii` fields and `primary_key`.
-*   **`chain_<name>s`**: key-value store for non-pii and `hashed` fields (EAV pattern).
-*   **`<name>s` (View)**: Joins the PII table with the latest values from the Chain table.
+## Generated schema layout
+
+- **`pii_{name}s`** — primary key, PII / query-index / FK columns, plus the
+  three audit columns. Soft-deleted rows have non-NULL `deleted_at`.
+- **`chain_{name}s`** — `(key, field_name, version, tx_hash, field_value, created_at)`.
+  The `version` is auto-assigned per `(key, field_name)` by the
+  `chain_{name}s_set_version_trigger` `BEFORE INSERT` trigger; field
+  values are TEXT, with the view casting back to `::jsonb` or `text[]`
+  where appropriate.
+- **`{name}s` (view)** — joins `pii_{name}s p` with one `LEFT JOIN`
+  per chain-stored field (`DISTINCT ON (key, field_name) … ORDER BY
+  version DESC` to pick the latest version). Audit columns are surfaced
+  from the PII table.
+
+## Repository surface (per message)
+
+| Method | Notes |
+|---|---|
+| `Save(ctx, *T)` | Inserts the PII row (`ON CONFLICT DO NOTHING`) then appends a new chain version for every chain field. |
+| `SavePii(ctx, *T)` | PII insert only. Errors on uniqueness/FK violations. |
+| `SaveChain(ctx, *T)` | Chain appends only. Useful for follow-up writes that don't touch PII. |
+| `Fetch(ctx, pk)` | Reads `*TView` from the view filtered by `deleted_at IS NULL`. |
+| `FetchBy{Unique}` | Generated for every `(sdm.unique)` field. |
+| `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the same soft-delete filter. |
