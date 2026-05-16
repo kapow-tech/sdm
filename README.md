@@ -4,9 +4,9 @@ SDM is a Go toolset for separating sensitive data (PII) from append-only chain
 data using Protobuf annotations. From a single annotated `.proto` file it
 generates:
 
-- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`)
+- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`) plus a `View.AsBaseModel()` converter
 - PostgreSQL DDL (PII table, chain table, combined view, version trigger)
-- A type-safe repository (`Save`, `Upsert`, `Update`, `SavePii`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`, `ChangeLog`)
+- A type-safe repository (`Save`, `SaveAll`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`, `ChangeLog`)
 
 A runnable end-to-end demo lives at
 [sdm-tool/sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
@@ -63,8 +63,13 @@ The chain table's `(key, field_name, version)` is a composite primary key.
 A `BEFORE INSERT` trigger sets `version = MAX(version) + 1` scoped to
 `(key, field_name)`, so each field's history is a per-(record, field)
 sequence — globally `1, 2, 3 …` per field, not a single sequence across the
-whole table. Every `Save`, `Upsert`, and `Update` call appends a new
-version for every chain-stored field — chain history is never rewritten.
+whole table. Chain history is append-only and never rewritten.
+
+**Skip-if-unchanged.** `SaveAll(_, true)` and `SaveChain` first read the
+latest stored value per chain field for the key (one `SELECT DISTINCT ON
+(field_name)`), then append a new version only when the byte-form differs.
+A re-save with identical data produces zero new chain rows; partial changes
+bump only the affected fields. Chain is a history of *changes*, not of saves.
 
 Chain row timestamps (`created_at`) are stored as `TIMESTAMP WITH TIME ZONE`
 so version history surfaces with the correct offset regardless of host /
@@ -85,6 +90,22 @@ type ChangeLog map[string]map[int64]ChangeLogEntry // field_name → version →
 
 Soft-deleted PII rows do **not** mask chain history — chain entries persist
 independently. Returns `gorm.ErrRecordNotFound` when the key has no chain rows.
+
+### View → base model
+
+Every `{Name}View` carries an `AsBaseModel()` method that returns a fresh
+`*{Name}` proto. Use it when you've fetched the view and want to mutate +
+re-`SaveAll` without manually mapping fields. The converter handles:
+
+- scalar / `*Message` fields — direct assignment
+- `google.protobuf.Timestamp` — `time.Time` → `timestamppb.New(...)` (skipped if zero)
+- `(sdm.json)=true` strings — `datatypes.JSON` → `string`
+- repeated scalar — `pq.StringArray` → `[]string`
+- repeated `*Message` — JSON-array bytes split + per-element `protojson`; malformed
+  elements are silently skipped (best-effort)
+
+Audit columns (`CreatedAt` / `UpdatedAt` / `DeletedAt` / `TxHash`) and `hashed_*`
+sidecar columns have no counterpart on the base proto and are dropped.
 
 ## Installation
 
@@ -187,12 +208,13 @@ import (
 db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 
 userRepo := user.NewUserRepo(db)
-userRepo.Save(ctx, &user.User{
+// SaveAll(_, true) upserts PII + appends a chain version per changed field.
+_ = userRepo.SaveAll(ctx, &user.User{
     UserId: "u_001", Email: "alice@example.com", Name: "Alice", Pan: "ABCDE1234F", Country: "IN",
-})
+}, true)
 
 repo := invoice.NewInvoiceRepo(db)
-err := repo.Save(ctx, &invoice.Invoice{
+inv := &invoice.Invoice{
     InvoiceId: "inv_001",
     SellerGst: "27AAA…", BuyerGst: "29BBB…",
     SellerId:  "u_001", BuyerId: "u_002",
@@ -201,38 +223,39 @@ err := repo.Save(ctx, &invoice.Invoice{
     Price:     &invoice.Money{Value: 10000, Unit: "INR"},
     Tags:      []string{"urgent", "paid"},
     Items:     []*invoice.Money{{Value: 9000, Unit: "INR"}, {Value: 1000, Unit: "INR"}},
-})
+}
+_ = repo.SaveAll(ctx, inv, true)
+
+// Save is a strict INSERT on the PII row — errors on PK / unique conflict.
+// Use it when you want the conflict to surface as an error rather than an upsert.
+err := repo.Save(ctx, &invoice.Invoice{InvoiceId: "inv_001", /* … */})
+// err is a Postgres unique-violation since inv_001 already exists.
+_ = err
 
 view, _ := repo.Fetch(ctx, "inv_001")
 // view.Price is *Money, view.Items is datatypes.JSON, view.Tags is pq.StringArray.
 // view.CreatedAt / view.UpdatedAt / view.DeletedAt are populated automatically.
 
-// Upsert: insert PII or overwrite mutable columns on conflict; always appends
-// a new chain version per chain-stored field.
-_ = repo.Upsert(ctx, &invoice.Invoice{
-    InvoiceId: "inv_001", SellerId: "u_001", BuyerId: "u_002",
-    SellerGst: "27AAA…", BuyerGst: "29BBB…",
-    Amount:    12000, // new amount → chain v2
-    Price:     &invoice.Money{Value: 12000, Unit: "INR"},
-})
+// AsBaseModel: convert the view back to the base proto for re-saves.
+roundTrip := view.AsBaseModel()
+roundTrip.Amount = 12000
+_ = repo.SaveAll(ctx, roundTrip, true) // chain v2 for amount; other fields unchanged → no-op
 
-// Update errors with gorm.ErrRecordNotFound when no PII row matches.
-_ = repo.Update(ctx, &invoice.Invoice{
-    InvoiceId: "inv_001",
-    Amount:    13000, // chain v3
-    // … other fields …
-})
+// SaveAll(_, false): upsert PII only, leave chain alone.
+_ = repo.SaveAll(ctx, roundTrip, false)
+
+// SaveChain: append chain entries only (still skip-if-unchanged).
+_ = repo.SaveChain(ctx, roundTrip)
 
 // Full per-field version history.
 log, _ := repo.ChangeLog(ctx, "inv_001")
 // log["amount"][1].Value == "10000"
 // log["amount"][2].Value == "12000"
-// log["amount"][3].Value == "13000"
-// log["amount"][3].Timestamp is the chain row's timestamptz created_at
+// log["amount"][2].Timestamp is the chain row's timestamptz created_at
 
 // Soft-delete via GORM:
 _ = db.Delete(&invoice.InvoicePii{InvoiceId: "inv_001"}).Error
-// Subsequent Fetch / Exists will return ErrRecordNotFound / false.
+// Subsequent Fetch / Exists return ErrRecordNotFound / false.
 // ChangeLog still returns the chain history — soft-delete does not mask it.
 ```
 
@@ -285,12 +308,16 @@ buf generate
 
 | Method | Notes |
 |---|---|
-| `Save(ctx, *T)` | Inserts the PII row (`ON CONFLICT DO NOTHING`) then appends a new chain version for every chain field. Idempotent on PII conflict — keeps the first row's values. |
-| `Upsert(ctx, *T)` | Inserts the PII row or overwrites mutable columns on conflict (`ON CONFLICT … DO UPDATE`); always appends new chain versions. Conflict target is the chain identifier key (PK or `chain_identifier_key + unique`). |
-| `Update(ctx, *T)` | Updates the existing PII row's mutable columns (chain key / PK / auto-increment excluded) and appends new chain versions. Returns `gorm.ErrRecordNotFound` if no PII row matches. |
-| `SavePii(ctx, *T)` | PII insert only. Errors on uniqueness/FK violations. |
-| `SaveChain(ctx, *T)` | Chain appends only. Useful for follow-up writes that don't touch PII. |
+| `Save(ctx, *T)` | **Strict INSERT** of the PII row only. Returns the driver-native error on PK / unique conflict. Does not touch the chain table. |
+| `SaveAll(ctx, *T, withChain bool)` | Upserts the PII row (`ON CONFLICT … DO UPDATE` on the chain identifier key); when `withChain=true`, also appends new chain versions for every field whose value changed (skip-if-unchanged). |
+| `SaveChain(ctx, *T)` | Chain appends only — also skip-if-unchanged per field. |
 | `Fetch(ctx, pk)` | Reads `*TView` from the view filtered by `deleted_at IS NULL`. |
 | `FetchBy{Unique}` | Generated for every `(sdm.unique)` field. |
 | `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the same soft-delete filter. |
 | `ChangeLog(ctx, key)` | Returns the full per-field version history as `map[field_name]map[version]{Value, Timestamp}`. Returns `gorm.ErrRecordNotFound` if no chain rows exist. |
+
+### View methods
+
+| Method | Notes |
+|---|---|
+| `View.AsBaseModel() *T` | Converts the view row back to the base proto model (Timestamp → `timestamppb`, repeated message JSON → `[]*Message`, datatypes.JSON → string, pq.StringArray → []string). Audit columns and hashed sidecars are dropped. |
