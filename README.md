@@ -4,9 +4,13 @@ SDM is a Go toolset for separating sensitive data (PII) from append-only chain
 data using Protobuf annotations. From a single annotated `.proto` file it
 generates:
 
-- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`) plus a `View.AsBaseModel()` converter
-- PostgreSQL DDL (PII table, chain table, combined view, version trigger)
-- A type-safe repository (`Save`, `SaveAll`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`, `ChangeLog`)
+- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`, optionally `{Name}PiiAudit`) plus a `View.AsBaseModel()` converter
+- PostgreSQL DDL (PII table, chain table, combined view, version trigger; optionally an audit table + AFTER UPDATE/DELETE trigger)
+- A type-safe repository (`Save`, `SaveAll`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`, `ChangeLog`, optionally `AuditLog`)
+- A single ctx-based actor channel (`WithActor`) that populates `created_by` on PII / chain and `changed_by` on audit rows
+
+The audit table emission is gated by the `create-audit-tables` config knob
+(default `true`); the actor wiring works in both modes.
 
 A runnable end-to-end demo lives at
 [sdm-tool/sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
@@ -32,6 +36,7 @@ A runnable end-to-end demo lives at
 | Proto type | PII Go type | Chain serialization | View Go type |
 |---|---|---|---|
 | `string`, `int32`, `int64`, `bool` | Native | `fmt.Sprintf("%v", …)` | Native |
+| `enum` | Typed enum | `fmt.Sprintf("%v", …)` (enum's registered name) | `string` (recovered to typed enum by `AsBaseModel` via `EnumType_value`) |
 | `string` + `(sdm.json) = true` | `datatypes.JSON` | Raw JSON text | `datatypes.JSON` |
 | `google.protobuf.Timestamp` | `time.Time` (via `.AsTime()`) | `time.RFC3339Nano` text (view casts back via `::timestamptz`) | `time.Time` |
 | Nested `MessageType` | `*MessageType` (with `serializer:protojson`) | `protojson.Marshal(...)` | `*MessageType` (auto-decoded by serializer) |
@@ -48,19 +53,56 @@ column. Empty / nil slices round-trip as the literal `[]`.
 
 ### Baked-in audit + soft-delete
 
-Every PII table receives three columns by default:
+Every PII table receives four columns by default:
 
 ```sql
 created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
 updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
 deleted_at TIMESTAMP WITH TIME ZONE NULL,
+created_by TEXT NOT NULL DEFAULT '',
 ```
 
-The generated PII and View structs carry these as `time.Time` / `gorm.DeletedAt`.
-`db.Delete(&xPii)` performs soft-delete (sets `deleted_at = NOW()`); all
-generated `Fetch` / `FetchBy{X}` / `Exists` / `ExistsBy{X}` methods append
-an explicit `WHERE deleted_at IS NULL` filter so soft-deleted rows stay
-hidden.
+`created_by` is set at INSERT from the actor on the ctx (see [Actor
+attribution](#actor-attribution) below) and is preserved across upserts.
+There is **no** `updated_by` column — "who last updated this row" lives
+per-change in `audit_pii_{name}s.changed_by` (see [PII audit log](#pii-audit-log)).
+Dropping the column avoids drift between row-level state and the audit
+trail and removes a redundant write on every upsert.
+
+The generated PII and View structs carry the timestamps as `time.Time` /
+`gorm.DeletedAt`. `db.Delete(&xPii)` performs soft-delete (sets
+`deleted_at = NOW()`); all generated `Fetch` / `FetchBy{X}` / `Exists` /
+`ExistsBy{X}` methods append an explicit `WHERE deleted_at IS NULL` filter
+so soft-deleted rows stay hidden.
+
+### Actor attribution
+
+Pass the actor identifier on ctx with `{pkg}.WithActor(ctx, actorID)`
+once at a request boundary (HTTP/gRPC middleware, batch job startup, CLI
+entrypoint). All downstream `Save` / `SaveAll` / `SaveChain` calls
+inherit it:
+
+```go
+ctx := user.WithActor(ctx, "alice@example.com")
+repo.SaveAll(ctx, u, true)
+// → pii.created_by   = "alice@example.com"   (at INSERT only)
+// → chain.created_by = "alice@example.com"   (every appended chain row)
+// → audit.changed_by = "alice@example.com"   (every UPDATE / DELETE)
+```
+
+The actor lands in three sinks:
+
+| Sink | When written | Notes |
+|---|---|---|
+| `pii_{name}s.created_by` | INSERT only | Immutable across upserts — first writer wins. |
+| `chain_{name}s.created_by` | Every new chain row | Append-only — each version records who appended it. |
+| `audit_pii_{name}s.changed_by` | Every UPDATE / DELETE | Written by the AFTER trigger from the `sdm.actor` Postgres session variable. |
+
+Repos that aren't wrapped with `WithActor` (bare `context.Background()`)
+record `""` for all three. Direct GORM calls that bypass the generated
+Save methods (`db.Exec("UPDATE …")`, `db.Unscoped().Delete(...)`) still
+fire the audit trigger but record `""` because they don't set the
+session variable.
 
 ### Chain versioning
 
@@ -78,7 +120,9 @@ bump only the affected fields. Chain is a history of *changes*, not of saves.
 
 Chain row timestamps (`created_at`) are stored as `TIMESTAMP WITH TIME ZONE`
 so version history surfaces with the correct offset regardless of host /
-server tz drift.
+server tz drift. Each chain row also carries a `created_by TEXT` column
+populated from the same actor that wrote it (see [Actor
+attribution](#actor-attribution)).
 
 ### Change log
 
@@ -96,21 +140,84 @@ type ChangeLog map[string]map[int64]ChangeLogEntry // field_name → version →
 Soft-deleted PII rows do **not** mask chain history — chain entries persist
 independently. Returns `gorm.ErrRecordNotFound` when the key has no chain rows.
 
+### PII audit log
+
+When enabled (default), every PII table gets a sibling `audit_pii_{name}s`
+table plus an `AFTER UPDATE OR DELETE` trigger that captures the row as it
+existed BEFORE each change. `INSERT` is not audited — the chain table
+already records the newly-introduced values.
+
+Schema:
+
+```sql
+CREATE TABLE audit_pii_users (
+  id BIGSERIAL PRIMARY KEY,
+  ref_id TEXT NOT NULL,                          -- PK as text (composite PKs joined with ':')
+  last_value JSONB NOT NULL,                     -- row_to_json(OLD)
+  change_type TEXT NOT NULL,                     -- 'UPDATE' or 'DELETE' (TG_OP)
+  changed_by TEXT NOT NULL DEFAULT '',           -- from session var sdm.actor
+  changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Attribution** flows through the ctx-based actor described above. The
+generated `Save` / `SaveAll` methods run `SELECT set_config('sdm.actor', $1, true)`
+inside the same transaction as the PII write; the trigger reads it via
+`current_setting('sdm.actor', true)`. Because `SET LOCAL` (via
+`set_config(..., true)`) is transaction-scoped, the attribution does not
+leak between requests.
+
+**Reading the history** — `repo.AuditLog(ctx, pk)` returns
+`[]{Name}PiiAudit` in chronological order:
+
+```go
+rows, _ := userRepo.AuditLog(ctx, u.Id)
+for _, r := range rows {
+    fmt.Printf("%s by %s at %s: %s\n",
+        r.ChangeType, r.ChangedBy, r.ChangedAt, string(r.LastValue))
+}
+```
+
+GORM soft-deletes (`db.Delete(&pii)` when the struct has
+`gorm.DeletedAt`) appear as `change_type = 'UPDATE'` because the underlying
+SQL is `UPDATE … SET deleted_at = NOW()`. Hard deletes
+(`db.Unscoped().Delete(...)`) appear as `'DELETE'`.
+
+**Disabling audit tables** — set `create-audit-tables: false` in
+`sdm.cfg.yaml` (or pass `--sdm_opt=create-audit-tables=false` when
+invoking `protoc-gen-sdm` directly from buf). When off, the generator
+skips:
+
+- the `audit_pii_{name}s` table and its trigger function
+- the `{Name}PiiAudit` Go struct
+- the `Repo.AuditLog` method
+- the `SELECT set_config('sdm.actor', …)` call inside Save/SaveAll (no
+  trigger to read it)
+
+The actor still populates `pii.created_by` and `chain.created_by`; only
+the per-change history disappears. If your test suite includes audit
+assertions, tag them with `//go:build !noaudit` so they're skipped by
+`go test -tags noaudit` against an audit-off generation. The demo
+integration suite uses this pattern — see
+[sdm-example/demo/integration/audit_test.go](https://github.com/jinuthankachan/sdm-examples/blob/main/demo/integration/audit_test.go).
+
 ### View → base model
 
 Every `{Name}View` carries an `AsBaseModel()` method that returns a fresh
 `*{Name}` proto. Use it when you've fetched the view and want to mutate +
 re-`SaveAll` without manually mapping fields. The converter handles:
 
-- scalar / `*Message` fields — direct assignment
+- scalar fields — direct assignment
+- `enum` fields — `string` → typed enum via the proto-generated `{EnumType}_value` map lookup
+- `*Message` fields — direct assignment (`serializer:protojson` already decoded on read)
 - `google.protobuf.Timestamp` — `time.Time` → `timestamppb.New(...)` (skipped if zero)
 - `(sdm.json)=true` strings — `datatypes.JSON` → `string`
 - repeated scalar — `pq.StringArray` → `[]string`
-- repeated `*Message` — JSON-array bytes split + per-element `protojson`; malformed
-  elements are silently skipped (best-effort)
+- repeated `*Message` — direct assignment (`[]*Message` already decoded by the `protojsonArray` serializer)
 
-Audit columns (`CreatedAt` / `UpdatedAt` / `DeletedAt` / `TxHash`) and `hashed_*`
-sidecar columns have no counterpart on the base proto and are dropped.
+Audit columns (`CreatedAt` / `UpdatedAt` / `DeletedAt` / `CreatedBy` / `TxHash`)
+and `hashed_*` sidecar columns have no counterpart on the base proto and
+are dropped.
 
 ## Installation
 
@@ -124,6 +231,37 @@ Two more steps put the project on a clean footing:
 sdm config   # writes sdm.cfg.yaml in the current directory
 sdm setup    # installs protoc-gen-go, buf, protoc-gen-sdm; exports SDM protos
 ```
+
+## Configuration (`sdm.cfg.yaml`)
+
+```yaml
+# Version of the sdm to use
+sdm: "dev"
+
+# Where the SDM annotation protos were exported by `sdm setup` (relative to this file)
+sdm-proto: "proto/"
+
+# Protos to compile and generate from (relative to this file)
+user-protos:
+  - "proto/user/user.proto"
+  - "proto/invoice/invoice.proto"
+
+# Where to write generated Go files
+output: "models/"
+
+# Where to write generated SQL files (defaults to `output` when omitted)
+output-sql: "models/sql/"
+
+# Emit audit_pii_{name}s tables + AFTER UPDATE/DELETE trigger +
+# {Name}PiiAudit struct + Repo.AuditLog method. Defaults to true.
+# When false, the actor still flows into pii.created_by /
+# chain.created_by — those columns are independent.
+create-audit-tables: true
+```
+
+All paths are resolved relative to the directory containing `sdm.cfg.yaml`.
+The same `create-audit-tables` knob is also exposed to direct buf/protoc
+usage via `--sdm_opt=create-audit-tables=false`.
 
 ## Usage
 
@@ -174,7 +312,9 @@ message User {
 
 ### 2. Generate
 
-With `sdm.cfg.yaml`:
+A minimal `sdm.cfg.yaml` (see [Configuration](#configuration-sdmcfgyaml)
+for the full reference, including `create-audit-tables`):
+
 ```yaml
 sdm: "dev"
 sdm-proto: "proto/"
@@ -191,13 +331,14 @@ sdm generate
 
 Per proto, four files are emitted:
 - `{name}.pb.go` — standard protobuf code
-- `{name}_sdm_model.go` — `{Name}Pii`, `{Name}Chain`, `{Name}View` structs
-- `{name}_sdm_schema.sql` — `CREATE TABLE`s, the version trigger, the view
+- `{name}_sdm_model.go` — `{Name}Pii`, `{Name}Chain`, `{Name}View` structs (plus `{Name}PiiAudit` when `create-audit-tables: true`)
+- `{name}_sdm_schema.sql` — `CREATE TABLE`s, the version trigger, the view (plus the audit table + trigger when enabled)
 - `{name}_sdm_repo.go` — GORM repository
 
 A single `sdm_helpers.go` per package holds `pgArrayLiteral` (for repeated
-scalar fields), the `ChangeLog` / `ChangeLogEntry` types, and — when nested
-messages are present — the `protojson` GORM serializer.
+scalar fields), the `ChangeLog` / `ChangeLogEntry` types, the
+`WithActor` / `actorFromContext` ctx helpers, and — when nested messages
+are present — the `protojson` / `protojsonArray` GORM serializers.
 
 ### 3. Use in Go
 
@@ -212,8 +353,13 @@ import (
 
 db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 
+// Attribute every downstream write to a single actor. Set once at a
+// request / job boundary; all repo calls on this ctx inherit it.
+ctx := user.WithActor(context.Background(), "alice@example.com")
+
 userRepo := user.NewUserRepo(db)
 // SaveAll(_, true) upserts PII + appends a chain version per changed field.
+// pii.created_by + chain.created_by are populated from the ctx actor.
 _ = userRepo.SaveAll(ctx, &user.User{
     UserId: "u_001", Email: "alice@example.com", Name: "Alice", Pan: "ABCDE1234F", Country: "IN",
 }, true)
@@ -239,7 +385,8 @@ _ = err
 
 view, _ := repo.Fetch(ctx, "inv_001")
 // view.Price is *Money, view.Items is datatypes.JSON, view.Tags is pq.StringArray.
-// view.CreatedAt / view.UpdatedAt / view.DeletedAt are populated automatically.
+// view.CreatedAt / view.UpdatedAt / view.DeletedAt / view.CreatedBy are populated automatically.
+// (For "who last updated this row", call repo.AuditLog and read the latest row's ChangedBy.)
 
 // AsBaseModel: convert the view back to the base proto for re-saves.
 roundTrip := view.AsBaseModel()
@@ -262,6 +409,12 @@ log, _ := repo.ChangeLog(ctx, "inv_001")
 _ = db.Delete(&invoice.InvoicePii{InvoiceId: "inv_001"}).Error
 // Subsequent Fetch / Exists return ErrRecordNotFound / false.
 // ChangeLog still returns the chain history — soft-delete does not mask it.
+
+// Per-change audit history (audit-on only).
+audit, _ := repo.AuditLog(ctx, "inv_001")
+for _, r := range audit {
+    fmt.Printf("%s by %q at %s\n", r.ChangeType, r.ChangedBy, r.ChangedAt)
+}
 ```
 
 ## CLI Reference
@@ -297,29 +450,40 @@ buf generate
 ## Generated schema layout
 
 - **`pii_{name}s`** — primary key, PII / query-index / FK columns, plus the
-  three audit columns (all `TIMESTAMP WITH TIME ZONE`). Soft-deleted rows
-  have non-NULL `deleted_at`.
-- **`chain_{name}s`** — `(key, field_name, version, tx_hash, field_value, created_at)`.
-  `created_at` is `TIMESTAMP WITH TIME ZONE`. The `version` is auto-assigned
-  per `(key, field_name)` by the `chain_{name}s_set_version_trigger`
+  three timestamp audit columns (`created_at`, `updated_at`, `deleted_at`,
+  all `TIMESTAMP WITH TIME ZONE`) and `created_by TEXT`. Soft-deleted rows
+  have non-NULL `deleted_at`. `created_by` is set at INSERT from the ctx
+  actor and preserved across upserts.
+- **`audit_pii_{name}s`** *(emitted when `create-audit-tables: true`)* —
+  `(id, ref_id, last_value, change_type, changed_by, changed_at)`.
+  Populated by the `audit_pii_{name}s_log_trigger` `AFTER UPDATE OR DELETE`
+  trigger on `pii_{name}s`. `last_value` is `row_to_json(OLD)::jsonb`;
+  `change_type` is the trigger's `TG_OP`; `changed_by` reads from the
+  `sdm.actor` Postgres session variable (transaction-scoped via `SET LOCAL`).
+- **`chain_{name}s`** — `(key, field_name, version, tx_hash, field_value, created_at, created_by)`.
+  `created_at` is `TIMESTAMP WITH TIME ZONE`; `created_by TEXT` records the
+  actor that appended the row. The `version` is auto-assigned per
+  `(key, field_name)` by the `chain_{name}s_set_version_trigger`
   `BEFORE INSERT` trigger; field values are TEXT, with the view casting back
   to `::jsonb`, `::timestamptz`, or `text[]` where appropriate.
 - **`{name}s` (view)** — joins `pii_{name}s p` with one `LEFT JOIN`
   per chain-stored field (`DISTINCT ON (key, field_name) … ORDER BY
-  version DESC` to pick the latest version). Audit columns are surfaced
-  from the PII table.
+  version DESC` to pick the latest version). PII audit columns including
+  `created_by` are surfaced; per-update history lives in
+  `audit_pii_{name}s` (when enabled) rather than on the row.
 
 ## Repository surface (per message)
 
 | Method | Notes |
 |---|---|
-| `Save(ctx, *T)` | **Strict INSERT** of the PII row only. Returns the driver-native error on PK / unique conflict. Does not touch the chain table. |
-| `SaveAll(ctx, *T, withChain bool)` | Upserts the PII row (`ON CONFLICT … DO UPDATE` on the chain identifier key); when `withChain=true`, also appends new chain versions for every field whose value changed (skip-if-unchanged). |
-| `SaveChain(ctx, *T)` | Chain appends only — also skip-if-unchanged per field. |
+| `Save(ctx, *T)` | **Strict INSERT** of the PII row only. Returns the driver-native error on PK / unique conflict. Does not touch the chain table. Honors `WithActor` (writes `pii.created_by`). |
+| `SaveAll(ctx, *T, withChain bool)` | Upserts the PII row (`ON CONFLICT … DO UPDATE` on the chain identifier key); when `withChain=true`, also appends new chain versions for every field whose value changed (skip-if-unchanged). Honors `WithActor` (writes `pii.created_by` at INSERT and `chain.created_by` on appended chain rows; trigger writes `audit.changed_by`). |
+| `SaveChain(ctx, *T)` | Chain appends only — also skip-if-unchanged per field. Honors `WithActor` (writes `chain.created_by`). |
 | `Fetch(ctx, pk)` | Reads `*TView` from the view filtered by `deleted_at IS NULL`. |
 | `FetchBy{Unique}` | Generated for every `(sdm.unique)` field. |
 | `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the same soft-delete filter. |
 | `ChangeLog(ctx, key)` | Returns the full per-field version history as `map[field_name]map[version]{Value, Timestamp}`. Returns `gorm.ErrRecordNotFound` if no chain rows exist. |
+| `AuditLog(ctx, pk)` *(audit-on only)* | Returns `[]{Name}PiiAudit` rows for one PII record, oldest first. Each row carries `LastValue` (OLD as JSONB), `ChangeType` (`'UPDATE'`/`'DELETE'`), `ChangedBy` (from the `WithActor` ctx), and `ChangedAt`. Not emitted when `create-audit-tables: false`. |
 
 ### View methods
 
