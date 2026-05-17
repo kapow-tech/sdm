@@ -5,12 +5,14 @@ data using Protobuf annotations. From a single annotated `.proto` file it
 generates:
 
 - Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`, optionally `{Name}PiiAudit`) plus a `View.AsBaseModel()` converter
-- PostgreSQL DDL (PII table, chain table, combined view, version trigger; optionally an audit table + AFTER UPDATE/DELETE trigger)
-- A type-safe repository (`Save`, `SaveAll`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`, `ChangeLog`, optionally `AuditLog`)
+- PostgreSQL DDL (PII table, chain table, combined view, version trigger; optionally an audit table + AFTER UPDATE/DELETE trigger; optionally a state-machine trigger + partial unique index for chain drafts)
+- A type-safe repository whose surface depends on which optional features are enabled (see [Repository surface](#repository-surface-per-message))
 - A single ctx-based actor channel (`WithActor`) that populates `created_by` on PII / chain and `changed_by` on audit rows
 
-The audit table emission is gated by the `create-audit-tables` config knob
-(default `true`); the actor wiring works in both modes.
+Two config knobs gate optional behavior:
+
+- `create-audit-tables` (default `true`) — emit per-PII audit tables, the AFTER UPDATE/DELETE trigger, the `{Name}PiiAudit` struct, and `Repo.AuditLog`. See [PII audit log](#pii-audit-log).
+- `chain-drafts` (default `false`) — opt-in draft/commit workflow on chain rows. Each chain row carries a status (DRAFTED / CREATED / DROPPED); the repo emits `DraftChain` / `CommitChain` / `DropChain` plus `Upsert` / `Update` (and SaveAll / SaveChain are NOT emitted); Fetch takes a `drafted bool` parameter. See [Chain drafts](#chain-drafts-opt-in).
 
 A runnable end-to-end demo lives at
 [sdm-tool/sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
@@ -112,17 +114,121 @@ A `BEFORE INSERT` trigger sets `version = MAX(version) + 1` scoped to
 sequence — globally `1, 2, 3 …` per field, not a single sequence across the
 whole table. Chain history is append-only and never rewritten.
 
-**Skip-if-unchanged.** `SaveAll(_, true)` and `SaveChain` first read the
-latest stored value per chain field for the key (one `SELECT DISTINCT ON
-(field_name)`), then append a new version only when the byte-form differs.
-A re-save with identical data produces zero new chain rows; partial changes
-bump only the affected fields. Chain is a history of *changes*, not of saves.
+**Skip-if-unchanged.** Every chain-writing method (`SaveAll(_, true)` in OFF
+mode; `DraftChain` / `Save` / `Upsert` / `Update` in ON mode) first reads
+the latest stored value per chain field for the key (one `SELECT DISTINCT
+ON (field_name)`), then appends a new version only when the byte-form
+differs. A re-save with identical data produces zero new chain rows;
+partial changes bump only the affected fields. Chain is a history of
+*changes*, not of saves. In chain-drafts mode the baseline is the latest
+CREATED row only, so re-drafting a value identical to the last committed
+state is a no-op even if intervening drafts were dropped.
 
 Chain row timestamps (`created_at`) are stored as `TIMESTAMP WITH TIME ZONE`
 so version history surfaces with the correct offset regardless of host /
 server tz drift. Each chain row also carries a `created_by TEXT` column
 populated from the same actor that wrote it (see [Actor
 attribution](#actor-attribution)).
+
+### Chain drafts (opt-in)
+
+Enabled by setting `chain-drafts: true` in `sdm.cfg.yaml` (or
+`--sdm_opt=chain-drafts=true` for direct `protoc-gen-sdm` usage). Stages
+chain changes as drafts that callers can later commit or drop, with the
+state machine enforced by a Postgres trigger.
+
+**Schema additions** (ON mode):
+
+```sql
+-- New column on every chain_<name>s table
+status TEXT NOT NULL DEFAULT 'CREATED'
+  CHECK (status IN ('DRAFTED', 'CREATED', 'DROPPED'))
+
+-- At-most-one DRAFTED row per (key, field_name) — DB-enforced
+CREATE UNIQUE INDEX chain_<name>s_one_draft
+  ON chain_<name>s (key, field_name)
+  WHERE status = 'DRAFTED';
+
+-- BEFORE UPDATE trigger that allows DRAFTED→CREATED, DRAFTED→DROPPED, or
+-- "status unchanged"; everything else raises an exception.
+```
+
+**Two views** are emitted instead of one:
+
+- `<name>s` — committed view (filters chain JOINs to `status='CREATED'`). What `Fetch(_, _, drafted=false)` reads.
+- `<name>s_with_drafts` — overlay view (filters chain JOINs to `status<>'DROPPED'`, so a DRAFTED value supersedes the prior CREATED). What `Fetch(_, _, drafted=true)` reads.
+
+Both views additionally expose `has_pending_drafts bool` — an `EXISTS` subquery against `chain_<name>s` for any DRAFTED row at this key. Surfaced on the View struct as `HasPendingDrafts`, independent of which view you queried. Use it as a signal that "this record has uncommitted changes" without paying a second round-trip.
+
+**Repository surface** changes when ON:
+
+| Replaces | New |
+|---|---|
+| `SaveAll(ctx, m, true)` | `Upsert(ctx, m)` + `CommitChain(ctx, key, txHash)` |
+| `SaveAll(ctx, m, false)` | `Upsert(ctx, m)` (drafts the chain side; commit later or drop) |
+| `SaveChain(ctx, m)` | `DraftChain(ctx, m)` + `CommitChain(ctx, key, txHash)` |
+| — | `Update(ctx, m)` — strict UPDATE (errors with `gorm.ErrRecordNotFound` if missing) + `DraftChain` |
+| — | `DropChain(ctx, key)` — promote DRAFTED → DROPPED for that key |
+| `Fetch(ctx, pk)` | `Fetch(ctx, pk, drafted bool)` — `false` reads `<name>s`; `true` reads `<name>s_with_drafts` |
+
+`Save` (PII strict INSERT) is emitted in both modes; in ON mode it also chains into `DraftChain` after the PII INSERT, all in the same transaction. `Exists` / `ExistsBy*` / `ChangeLog` / `AuditLog` are unchanged.
+
+**Workflow**:
+
+```go
+ctx := invoice.WithActor(ctx, "alice@example.com")
+
+// 1. Save: PII committed; chain rows staged as DRAFTED.
+_ = repo.Save(ctx, &invoice.Invoice{
+    InvoiceId: "inv_1", SellerId: "u_1", BuyerId: "u_2",
+    Amount: 10000, Tags: []string{"draft"},
+})
+
+// 2. Committed view doesn't show the chain values yet…
+v, _ := repo.Fetch(ctx, "inv_1", false)
+fmt.Println(v.Amount, v.HasPendingDrafts) // 0 true
+
+// 3. …but the overlay does.
+v, _ = repo.Fetch(ctx, "inv_1", true)
+fmt.Println(v.Amount, v.Tags)             // 10000 [draft]
+
+// 4. Decide: commit (with optional tx_hash) or drop.
+_ = repo.CommitChain(ctx, "inv_1", "tx-abc-123")
+//   …or:
+// _ = repo.DropChain(ctx, "inv_1")
+
+// 5. Committed view now reflects the change; HasPendingDrafts flips false.
+v, _ = repo.Fetch(ctx, "inv_1", false)
+fmt.Println(v.Amount, v.TxHash, v.HasPendingDrafts) // 10000 tx-abc-123 false
+```
+
+**Sentinel error**. `DraftChain` (and by extension `Save` / `Upsert` /
+`Update` when chain-drafts is ON) returns `ErrPendingDraftExists` if any
+chain field of the record already has a pending DRAFTED row. The caller's
+recourse is to commit (`CommitChain`) or drop (`DropChain`) the existing
+draft first.
+
+```go
+if err := repo.Upsert(ctx, inv); err != nil {
+    if errors.Is(err, invoice.ErrPendingDraftExists) {
+        // surface to caller — they need to resolve the pending draft
+    }
+    return err
+}
+```
+
+**Known caveat — half-state visibility.** Because `Save` / `Upsert` /
+`Update` commit the PII row immediately but stage chain rows as DRAFTED,
+the committed view will show the PII columns updated and the chain
+columns NULL (or stale) until `CommitChain` runs. `HasPendingDrafts`
+flags this on every read; pass `drafted=true` to read the overlay. Atomic
+"PII + chain commit" is on the roadmap — for now the explicit two-step
+flow is the contract.
+
+**Testing pattern**. Because the repo surface differs across modes,
+existing demo tests that use `SaveAll` are tagged `//go:build !chaindrafts`
+and chain-drafts tests are tagged `//go:build chaindrafts`. Run against an
+ON-mode generation with `go test -tags chaindrafts ./integration/...`.
 
 ### Change log
 
@@ -257,11 +363,19 @@ output-sql: "models/sql/"
 # When false, the actor still flows into pii.created_by /
 # chain.created_by — those columns are independent.
 create-audit-tables: true
+
+# Opt-in chain draft/commit workflow. When true the generator swaps
+# SaveAll for Upsert/Update + DraftChain/CommitChain/DropChain, emits
+# a status column + partial unique index + state-machine trigger on
+# every chain table, emits two views (committed + with-drafts), and
+# Fetch / FetchBy* gain a trailing `drafted bool` parameter. Defaults
+# to false. See the "Chain drafts (opt-in)" section below.
+chain-drafts: false
 ```
 
 All paths are resolved relative to the directory containing `sdm.cfg.yaml`.
-The same `create-audit-tables` knob is also exposed to direct buf/protoc
-usage via `--sdm_opt=create-audit-tables=false`.
+Both knobs are also exposed to direct buf/protoc usage:
+`--sdm_opt=create-audit-tables=false`, `--sdm_opt=chain-drafts=true`.
 
 ## Usage
 
@@ -337,10 +451,14 @@ Per proto, four files are emitted:
 
 A single `sdm_helpers.go` per package holds `pgArrayLiteral` (for repeated
 scalar fields), the `ChangeLog` / `ChangeLogEntry` types, the
-`WithActor` / `actorFromContext` ctx helpers, and — when nested messages
-are present — the `protojson` / `protojsonArray` GORM serializers.
+`WithActor` / `actorFromContext` ctx helpers, `ErrPendingDraftExists` (when
+`chain-drafts: true`), and — when nested messages are present — the
+`protojson` / `protojsonArray` GORM serializers.
 
 ### 3. Use in Go
+
+The snippet below assumes the OFF-mode API (`chain-drafts: false`, the
+default). For the draft/commit workflow, see [Chain drafts](#chain-drafts-opt-in).
 
 ```go
 import (
@@ -466,24 +584,64 @@ buf generate
   `(key, field_name)` by the `chain_{name}s_set_version_trigger`
   `BEFORE INSERT` trigger; field values are TEXT, with the view casting back
   to `::jsonb`, `::timestamptz`, or `text[]` where appropriate.
+  *When chain-drafts is enabled*: an additional `status TEXT NOT NULL
+  DEFAULT 'CREATED' CHECK (status IN ('DRAFTED', 'CREATED', 'DROPPED'))`
+  column, a partial unique index `chain_{name}s_one_draft (key, field_name)
+  WHERE status='DRAFTED'`, and a `BEFORE UPDATE` trigger
+  `chain_{name}s_status_guard_trigger` enforcing legal transitions
+  (DRAFTED → CREATED, DRAFTED → DROPPED, status unchanged).
 - **`{name}s` (view)** — joins `pii_{name}s p` with one `LEFT JOIN`
   per chain-stored field (`DISTINCT ON (key, field_name) … ORDER BY
   version DESC` to pick the latest version). PII audit columns including
   `created_by` are surfaced; per-update history lives in
   `audit_pii_{name}s` (when enabled) rather than on the row.
+  *When chain-drafts is enabled*: each chain-side JOIN subquery filters
+  to `status='CREATED'` (committed only); a sibling view `{name}s_with_drafts`
+  filters to `status<>'DROPPED'` instead (overlay). Both views expose
+  `has_pending_drafts bool` via an `EXISTS` subquery, surfaced on the
+  View struct as `HasPendingDrafts`.
 
 ## Repository surface (per message)
 
+The exact method set depends on the `chain-drafts` knob — OFF mode emits
+the familiar `Save` / `SaveAll` pair; ON mode emits the draft-workflow
+trio (`Upsert` / `Update` / `DraftChain` / `CommitChain` / `DropChain`)
+instead. Read-side methods (`Fetch`, `Exists`, `ChangeLog`, `AuditLog`)
+exist in both modes; `Fetch` gains a trailing `drafted bool` parameter in
+ON mode.
+
+### Common to both modes
+
 | Method | Notes |
 |---|---|
-| `Save(ctx, *T)` | **Strict INSERT** of the PII row only. Returns the driver-native error on PK / unique conflict. Does not touch the chain table. Honors `WithActor` (writes `pii.created_by`). |
-| `SaveAll(ctx, *T, withChain bool)` | Upserts the PII row (`ON CONFLICT … DO UPDATE` on the chain identifier key); when `withChain=true`, also appends new chain versions for every field whose value changed (skip-if-unchanged). Honors `WithActor` (writes `pii.created_by` at INSERT and `chain.created_by` on appended chain rows; trigger writes `audit.changed_by`). |
-| `SaveChain(ctx, *T)` | Chain appends only — also skip-if-unchanged per field. Honors `WithActor` (writes `chain.created_by`). |
-| `Fetch(ctx, pk)` | Reads `*TView` from the view filtered by `deleted_at IS NULL`. |
-| `FetchBy{Unique}` | Generated for every `(sdm.unique)` field. |
-| `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the same soft-delete filter. |
+| `Save(ctx, *T)` | **Strict INSERT** of the PII row. Returns the driver-native error on PK / unique conflict. In OFF mode does not touch the chain table; in ON mode also calls `DraftChain` in the same transaction (chain rows staged as DRAFTED). Honors `WithActor` (writes `pii.created_by`). |
+| `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the `deleted_at IS NULL` filter. Not draft-aware — existence is answered by committed state. |
 | `ChangeLog(ctx, key)` | Returns the full per-field version history as `map[field_name]map[version]{Value, Timestamp}`. Returns `gorm.ErrRecordNotFound` if no chain rows exist. |
 | `AuditLog(ctx, pk)` *(audit-on only)* | Returns `[]{Name}PiiAudit` rows for one PII record, oldest first. Each row carries `LastValue` (OLD as JSONB), `ChangeType` (`'UPDATE'`/`'DELETE'`), `ChangedBy` (from the `WithActor` ctx), and `ChangedAt`. Not emitted when `create-audit-tables: false`. |
+
+### OFF mode (`chain-drafts: false`, default)
+
+| Method | Notes |
+|---|---|
+| `SaveAll(ctx, *T, withChain bool)` | Upserts the PII row (`ON CONFLICT … DO UPDATE` on the chain identifier key); when `withChain=true`, also appends new chain versions for every field whose value changed (skip-if-unchanged). Honors `WithActor`. |
+| `Fetch(ctx, pk)` | Reads `*TView` from the view, filtered by `deleted_at IS NULL`. |
+| `FetchBy{Unique}(ctx, val)` | Generated for every `(sdm.unique)` field. |
+
+### ON mode (`chain-drafts: true`)
+
+| Method | Notes |
+|---|---|
+| `Upsert(ctx, *T)` | PII upsert + `DraftChain` (chain rows staged as DRAFTED). Honors `WithActor`. |
+| `Update(ctx, *T)` | Strict PII UPDATE — returns `gorm.ErrRecordNotFound` when the row doesn't exist (no insert). Followed by `DraftChain`. Honors `WithActor`. |
+| `DraftChain(ctx, *T)` | Standalone draft entry — appends DRAFTED chain rows for fields differing from the latest CREATED. Returns `ErrPendingDraftExists` if a draft is already pending for any field of this record (resolve via `CommitChain` or `DropChain` first). Honors `WithActor` (writes `chain.created_by`). |
+| `CommitChain(ctx, key…, txHash string)` | Promotes every DRAFTED row for this key to CREATED in a single UPDATE, stamping `txHash` on the promoted rows (pass `""` if not applicable). Idempotent — no-op when no drafts exist. Trigger-enforced transition. |
+| `DropChain(ctx, key…)` | Promotes every DRAFTED row for this key to DROPPED in a single UPDATE. Idempotent. |
+| `Fetch(ctx, pk, drafted bool)` | `drafted=false` reads the committed view `<name>s`; `drafted=true` reads the overlay view `<name>s_with_drafts`. Both filtered by `deleted_at IS NULL`. View struct's `HasPendingDrafts` is populated regardless of which is queried. |
+| `FetchBy{Unique}(ctx, val, drafted bool)` | Same `drafted` semantics. |
+
+`SaveAll` and `SaveChain` are **not emitted** in ON mode — their atomic
+"PII + chain commit" semantics live in `Upsert` followed by an explicit
+`CommitChain`.
 
 ### View methods
 
