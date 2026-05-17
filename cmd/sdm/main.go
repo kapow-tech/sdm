@@ -160,6 +160,14 @@ sdm: "%s"
 # Set to false if you don't need row-level audit history (the actor still
 # populates pii.created_by / chain.created_by — those are independent).
 # create-audit-tables: true
+
+# Opt-in chain draft/commit workflow. When true: chain rows carry a status
+# (DRAFTED / CREATED / DROPPED), the repo emits DraftChain / CommitChain /
+# DropChain plus Upsert / Update (SaveAll and SaveChain are NOT emitted),
+# Save chains into DraftChain after the PII write, Fetch / FetchBy* take an
+# additional 'drafted bool' parameter, and two views are emitted (committed
+# and with-drafts). Defaults to false.
+# chain-drafts: false
 `, version)
 	if err := os.WriteFile("sdm.cfg.yaml", []byte(content), 0644); err != nil {
 		return fmt.Errorf("failed to write sdm.cfg.yaml: %w", err)
@@ -388,10 +396,11 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Effective generator options. `create-audit-tables` defaults to true
-	// when the YAML key is absent — preserves behavior for configs written
-	// before this knob existed.
+	// and `chain-drafts` defaults to false when the YAML keys are absent —
+	// preserves behavior for configs written before these knobs existed.
 	genOpts := generator.Options{
 		CreateAuditTables: cfg.AuditTablesEnabled(),
+		ChainDrafts:       cfg.ChainDraftsEnabled(),
 	}
 
 	// Emit sdm_helpers.go once per output directory (≈ Go package). Using a single
@@ -406,7 +415,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		generator.GenerateFile(gen, f, genOpts)
 		dir := path.Dir(f.GeneratedFilenamePrefix)
 		if !emittedHelpers[dir] {
-			generator.GenerateHelpers(gen, f)
+			generator.GenerateHelpers(gen, f, genOpts)
 			emittedHelpers[dir] = true
 		}
 	}

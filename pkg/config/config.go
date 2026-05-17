@@ -18,6 +18,15 @@ type Config struct {
 	// Repo.AuditLog method. Pointer so a missing YAML key defaults to true
 	// (back-compat with configs written before this knob existed).
 	CreateAuditTables *bool `yaml:"create-audit-tables"`
+	// ChainDrafts toggles the draft/commit workflow on chain rows. When true,
+	// each chain row carries a status (DRAFTED / CREATED / DROPPED), a partial
+	// unique index allows at most one DRAFTED row per (key, field_name), a
+	// BEFORE UPDATE trigger enforces legal transitions, and two views are
+	// emitted (committed-only and with-drafts). The generator emits
+	// DraftChain / CommitChain / DropChain methods plus Upsert / Update
+	// (instead of SaveAll / SaveChain). Pointer so a missing YAML key
+	// defaults to false (back-compat with configs written before this knob).
+	ChainDrafts *bool `yaml:"chain-drafts"`
 }
 
 // AuditTablesEnabled returns the effective value of CreateAuditTables,
@@ -27,6 +36,15 @@ func (c *Config) AuditTablesEnabled() bool {
 		return true
 	}
 	return *c.CreateAuditTables
+}
+
+// ChainDraftsEnabled returns the effective value of ChainDrafts,
+// defaulting to false when unset (the draft workflow is opt-in).
+func (c *Config) ChainDraftsEnabled() bool {
+	if c.ChainDrafts == nil {
+		return false
+	}
+	return *c.ChainDrafts
 }
 
 func LoadConfig(path string) (*Config, error) {
