@@ -383,7 +383,7 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 				viewTag = fmt.Sprintf("column:%s;type:text[]", field.Desc.Name())
 			}
 		} else {
-			goType = goTypeForField(field)
+			goType = goTypeForViewField(field)
 			viewTag = "column:" + string(field.Desc.Name())
 			if needsProtojsonMarshal(field) {
 				// View column comes from a ::jsonb cast over the chain's TEXT field_value
@@ -436,11 +436,13 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	// have no counterpart on the base proto model.
 	//
 	// Per-field conversion:
-	//   - scalar  / *Message   : direct assignment (types match)
-	//   - Timestamp            : time.Time → timestamppb.New (skipped if zero)
-	//   - (sdm.json)=true str  : datatypes.JSON → string
-	//   - repeated scalar      : pq.StringArray → []string
-	//   - repeated *Message    : direct assignment ([]*Message via protojsonArray serializer)
+	//   - scalar              : direct assignment (types match)
+	//   - enum                : string → EnumType via EnumType_value map lookup
+	//   - *Message            : direct assignment (serializer:protojson already decoded)
+	//   - Timestamp           : time.Time → timestamppb.New (skipped if zero)
+	//   - (sdm.json)=true str : datatypes.JSON → string
+	//   - repeated scalar     : pq.StringArray → []string
+	//   - repeated *Message   : direct assignment ([]*Message via protojsonArray serializer)
 	g.P("func (v *", modelName, "View) AsBaseModel() *", modelName, " {")
 	g.P("  base := &", modelName, "{}")
 	for _, field := range msg.Fields {
@@ -460,6 +462,12 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 			g.P("  base.", field.GoName, " = string(v.", field.GoName, ")")
 		case field.Desc.IsList():
 			g.P("  base.", field.GoName, " = []string(v.", field.GoName, ")")
+		case field.Desc.Kind() == protoreflect.EnumKind:
+			// View stores the enum as a plain string (fmt.Sprintf("%v", enumVal)
+			// produces the proto-registered name, e.g. "User_Status_Active").
+			// Recover the typed enum via the generated _value map.
+			enumType := field.Enum.GoIdent.GoName
+			g.P("  base.", field.GoName, " = ", enumType, "(", enumType, "_value[v.", field.GoName, "])")
 		default:
 			g.P("  base.", field.GoName, " = v.", field.GoName)
 		}
@@ -1418,6 +1426,10 @@ func jsonVarName(field *protogen.Field) string {
 }
 
 // goTypeForField maps proto field kinds to Go types.
+// Enum fields map to their Go type name (int32 alias) — NOT string.
+// The View struct stores enums as string (chain field_value); the PII struct
+// and proto model use the typed enum. goTypeForField is used for PII structs,
+// proto model fields, and repo parameters — all of which want the typed enum.
 func goTypeForField(field *protogen.Field) string {
 	// google.protobuf.Timestamp → time.Time (not *Timestamppb).
 	// Conversions happen at the model boundary via .AsTime() in Save.
@@ -1429,6 +1441,9 @@ func goTypeForField(field *protogen.Field) string {
 			return "[]*" + field.Message.GoIdent.GoName
 		}
 		return "*" + field.Message.GoIdent.GoName
+	}
+	if field.Desc.Kind() == protoreflect.EnumKind {
+		return field.Enum.GoIdent.GoName
 	}
 	if getFieldOptions(field).Json {
 		return "datatypes.JSON"
@@ -1447,6 +1462,16 @@ func goTypeForField(field *protogen.Field) string {
 		return "[]" + base
 	}
 	return base
+}
+
+// goTypeForViewField is goTypeForField for View struct fields.
+// Enum fields in the View are stored as string (chain field_value is TEXT),
+// so the GORM scan target must be string. Everything else delegates to goTypeForField.
+func goTypeForViewField(field *protogen.Field) string {
+	if field.Desc.Kind() == protoreflect.EnumKind {
+		return "string"
+	}
+	return goTypeForField(field)
 }
 
 // sqlTypeForField emits BIGSERIAL for auto_increment fields, TIMESTAMP WITH
