@@ -55,10 +55,11 @@ func GenerateHelpers(gen *protogen.Plugin, file *protogen.File) {
 	if needEncodingJson {
 		g.P(`	"encoding/json"`)
 	}
+	// `context` is always needed: WithChangedBy / changedByFromContext use it.
+	g.P(`	"context"`)
 	g.P(`	"strings"`)
 	g.P(`	"time"`)
 	if needReflectStack {
-		g.P(`	"context"`)
 		g.P(`	"fmt"`)
 		g.P(`	"reflect"`)
 		g.P(`	"google.golang.org/protobuf/encoding/protojson"`)
@@ -87,6 +88,29 @@ func GenerateHelpers(gen *protogen.Plugin, file *protogen.File) {
 	g.P("// monotonically increasing per (key, field_name), assigned by the chain")
 	g.P("// table's BEFORE INSERT trigger.")
 	g.P("type ChangeLog map[string]map[int64]ChangeLogEntry")
+	g.P()
+	g.P("// changedByKey is the context key carrying the user identifier that the")
+	g.P("// audit_pii_<name>s trigger will record as `changed_by`. Unexported so")
+	g.P("// callers must go through WithChangedBy / changedByFromContext.")
+	g.P("type changedByKey struct{}")
+	g.P()
+	g.P("// WithChangedBy returns a derived context that propagates `who` to the")
+	g.P("// audit_pii_<name>s.changed_by column for any PII mutation made through")
+	g.P("// the generated Save / SaveAll methods. The repo sets the Postgres")
+	g.P("// session variable `sdm.changed_by` at the start of the same transaction")
+	g.P("// as the write, scoping the attribution to that transaction. Reads,")
+	g.P("// SaveChain, and direct GORM operations (db.Delete / db.Exec) that do")
+	g.P("// not pass through Save / SaveAll record '' for changed_by.")
+	g.P("func WithChangedBy(ctx context.Context, who string) context.Context {")
+	g.P("  return context.WithValue(ctx, changedByKey{}, who)")
+	g.P("}")
+	g.P()
+	g.P("// changedByFromContext extracts the user identifier installed by")
+	g.P("// WithChangedBy, or \"\" if absent. Used by generated repo methods.")
+	g.P("func changedByFromContext(ctx context.Context) string {")
+	g.P("  if v, ok := ctx.Value(changedByKey{}).(string); ok { return v }")
+	g.P("  return \"\"")
+	g.P("}")
 	if needProtojson {
 		g.P()
 		emitProtojsonSerializer(g)
@@ -276,12 +300,13 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 	g.P()
 	g.P("package ", file.GoPackageName)
 	g.P()
+	// datatypes.JSON is used by string fields annotated (sdm.json)=true AND by
+	// every PII-backed message's `<Name>PiiAudit.LastValue` column (jsonb).
+	needDatatypes := fileHasStringJsonField(file) || fileHasPiiBackedMessage(file)
+
 	g.P("import (")
 	g.P(`	"time"`)
-	// datatypes.JSON is used by string fields annotated (sdm.json)=true. View
-	// repeated message fields are now typed []*Message via the protojsonArray
-	// serializer — they no longer need datatypes.JSON.
-	if fileHasStringJsonField(file) {
+	if needDatatypes {
 		g.P(`	"gorm.io/datatypes"`)
 	}
 	if needPq {
@@ -417,6 +442,24 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	g.P("func (", modelName, "Chain) TableName() string { return \"chain_", strings.ToLower(modelName), "s\" }")
 	g.P("func (", modelName, "View) TableName() string { return \"", strings.ToLower(modelName), "s\" }")
 	g.P()
+
+	// ── PII Audit struct ──────────────────────────────────────────────────────
+	// Mirror of audit_pii_<name>s. The table + trigger are emitted by
+	// generateSQL only for PII-backed messages, so the struct is only emitted
+	// here when !chainOnly.
+	if !chainOnly {
+		g.P("type ", modelName, "PiiAudit struct {")
+		g.P("  Id         int64          `gorm:\"column:id;primaryKey;autoIncrement\"`")
+		g.P("  RefId      string         `gorm:\"column:ref_id\"`")
+		g.P("  LastValue  datatypes.JSON `gorm:\"column:last_value;type:jsonb\"`")
+		g.P("  ChangeType string         `gorm:\"column:change_type\"`")
+		g.P("  ChangedBy  string         `gorm:\"column:changed_by\"`")
+		g.P("  ChangedAt  time.Time      `gorm:\"column:changed_at\"`")
+		g.P("}")
+		g.P()
+		g.P("func (", modelName, "PiiAudit) TableName() string { return \"audit_pii_", strings.ToLower(modelName), "s\" }")
+		g.P()
+	}
 
 	// ── EnsureUnique method ───────────────────────────────────────────────────
 	g.P("func (c *", modelName, "Chain) EnsureUnique(tx *gorm.DB) bool {")
@@ -590,6 +633,75 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 				}
 			}
 			g.P(");")
+			g.P()
+
+			// ── Audit Table + Trigger ─────────────────────────────────────────
+			// audit_pii_<name>s captures the full OLD row (as JSONB) on every
+			// UPDATE or DELETE against pii_<name>s. INSERTs aren't audited —
+			// the chain table already records the newly-introduced values.
+			//
+			// changed_by reads from the `sdm.changed_by` Postgres session
+			// variable. The generated Save / SaveAll methods set that variable
+			// inside their transaction when the context carries a value via
+			// WithChangedBy(ctx, who). Changes made through other paths
+			// (raw db.Exec, db.Delete outside a SaveAll transaction) record
+			// '' for changed_by.
+			//
+			// ref_id is TEXT (cast from the PK via ::text) so the same audit
+			// table works for both BIGINT and TEXT primary keys; composite PKs
+			// are joined with ':' to mirror the chain compositeKey scheme.
+			auditTable := fmt.Sprintf("audit_pii_%ss", modelName)
+			auditFn := fmt.Sprintf("audit_pii_%ss_log", modelName)
+			auditTrigger := fmt.Sprintf("audit_pii_%ss_log_trigger", modelName)
+			piiTable := fmt.Sprintf("pii_%ss", modelName)
+
+			g.P("CREATE TABLE IF NOT EXISTS ", auditTable, " (")
+			g.P("  id BIGSERIAL PRIMARY KEY,")
+			g.P("  ref_id TEXT NOT NULL,")
+			g.P("  last_value JSONB NOT NULL,")
+			g.P("  change_type TEXT NOT NULL,")
+			g.P("  changed_by TEXT NOT NULL DEFAULT '',")
+			g.P("  changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP")
+			g.P(");")
+			g.P()
+
+			// Compose the ref_id expression. Single-column PK is the common
+			// case (cast to text). Composite PK is joined with ':' to match
+			// chain compositeKey construction.
+			var refIDExpr string
+			switch len(pkCols) {
+			case 0:
+				// Should not happen for PII-backed messages (isSdmRecord requires PK
+				// or chain_identifier_key, and chainOnly is already false here).
+				refIDExpr = "''"
+			case 1:
+				refIDExpr = fmt.Sprintf("OLD.%s::text", pkCols[0])
+			default:
+				parts := make([]string, len(pkCols))
+				for i, c := range pkCols {
+					parts[i] = fmt.Sprintf("OLD.%s::text", c)
+				}
+				refIDExpr = strings.Join(parts, " || ':' || ")
+			}
+
+			g.P("CREATE OR REPLACE FUNCTION ", auditFn, "()")
+			g.P("RETURNS TRIGGER AS $$")
+			g.P("BEGIN")
+			g.P("  INSERT INTO ", auditTable, " (ref_id, last_value, change_type, changed_by)")
+			g.P("  VALUES (")
+			g.P("    ", refIDExpr, ",")
+			g.P("    row_to_json(OLD)::jsonb,")
+			g.P("    TG_OP,")
+			g.P("    COALESCE(current_setting('sdm.changed_by', true), '')")
+			g.P("  );")
+			g.P("  RETURN NULL;")
+			g.P("END;")
+			g.P("$$ LANGUAGE plpgsql;")
+			g.P()
+			g.P("DROP TRIGGER IF EXISTS ", auditTrigger, " ON ", piiTable, ";")
+			g.P("CREATE TRIGGER ", auditTrigger)
+			g.P("AFTER UPDATE OR DELETE ON ", piiTable)
+			g.P("FOR EACH ROW EXECUTE FUNCTION ", auditFn, "();")
 			g.P()
 		}
 
@@ -1053,6 +1165,17 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			}
 		}
 
+		// emitSetChangedBy installs the user identifier carried on ctx into
+		// the `sdm.changed_by` Postgres session variable, scoped to the
+		// current transaction (`is_local=true`). The audit_pii_<name>s
+		// trigger reads the same variable to populate changed_by. Skipped
+		// silently when no value is on the context.
+		emitSetChangedBy := func() {
+			g.P("    if _who := changedByFromContext(ctx); _who != \"\" {")
+			g.P("      if err := tx.Exec(\"SELECT set_config('sdm.changed_by', ?, true)\", _who).Error; err != nil { return err }")
+			g.P("    }")
+		}
+
 		// ── Save (PII-backed only) ────────────────────────────────────────────
 		// Strict INSERT of the PII row; errors with the driver-native error on
 		// primary-key / unique conflict. Does NOT touch the chain table — use
@@ -1060,6 +1183,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		if !chainOnly {
 			g.P("func (r *", modelName, "Repo) Save(ctx context.Context, model *", modelName, ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
+			emitSetChangedBy()
 			emitPiiStruct()
 			g.P("    if err := tx.Create(&pii).Error; err != nil { return err }")
 			emitAutoIncrementCopyback()
@@ -1095,6 +1219,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		if !chainOnly {
 			updatableCols := updatableSqlCols(msg)
 			conflictCol := string(keyFields[0].Desc.Name())
+			emitSetChangedBy()
 			emitPiiStruct()
 			g.P("    if err := tx.Clauses(clause.OnConflict{")
 			g.P("      Columns:   []clause.Column{{Name: \"", conflictCol, "\"}},")
@@ -1254,6 +1379,38 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 				g.P("}")
 				g.P()
 			}
+
+			// ── AuditLog (PII-backed only) ───────────────────────────────────
+			// Returns the audit_pii_<name>s history for a single record,
+			// chronologically (oldest first). Each row is a snapshot of the
+			// PII row immediately BEFORE an UPDATE or DELETE. Empty slice if
+			// the record was inserted but never modified.
+			//
+			// Param signature mirrors Fetch's — takes the PK fields. The audit
+			// table's ref_id is the PK joined with ':' for composite PKs.
+			var refIDExpr string
+			if len(whereArgs) == 1 {
+				refIDExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", %s)", whereArgs[0])
+			} else {
+				fmtParts := make([]string, len(whereArgs))
+				for i := range whereArgs {
+					fmtParts[i] = "%v"
+				}
+				refIDExpr = fmt.Sprintf("fmt.Sprintf(\"%s\", %s)",
+					strings.Join(fmtParts, ":"), strings.Join(whereArgs, ", "))
+			}
+			g.P("func (r *", modelName, "Repo) AuditLog(ctx context.Context, ",
+				strings.Join(fetchParams, ", "), ") ([]", modelName, "PiiAudit, error) {")
+			g.P("  var rows []", modelName, "PiiAudit")
+			g.P("  if err := r.db.WithContext(ctx).")
+			g.P("    Where(\"ref_id = ?\", ", refIDExpr, ").")
+			g.P("    Order(\"changed_at ASC, id ASC\").")
+			g.P("    Find(&rows).Error; err != nil {")
+			g.P("    return nil, err")
+			g.P("  }")
+			g.P("  return rows, nil")
+			g.P("}")
+			g.P()
 		}
 
 		// ── ChangeLog ────────────────────────────────────────────────────────
@@ -1598,6 +1755,22 @@ func fileHasTimestampField(file *protogen.File) bool {
 			if isProtoTimestamp(field) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// fileHasPiiBackedMessage reports whether any recorded message in the file
+// has a PII table (i.e. is not chain-only). PII-backed messages generate the
+// PiiAudit struct (which uses datatypes.JSON), so the model file's
+// `gorm.io/datatypes` import must be present.
+func fileHasPiiBackedMessage(file *protogen.File) bool {
+	for _, msg := range file.Messages {
+		if !isSdmRecord(msg) {
+			continue
+		}
+		if !isChainOnly(msg) {
+			return true
 		}
 	}
 	return false
