@@ -154,6 +154,12 @@ sdm: "%s"
 
 # Directory where to write the generated SQL files (defaults to output if not set)
 # output-sql: "gen/sql/"
+
+# Emit per-PII audit tables + AFTER UPDATE/DELETE trigger + <Name>PiiAudit
+# struct + Repo.AuditLog method. Defaults to true when this key is absent.
+# Set to false if you don't need row-level audit history (the actor still
+# populates pii.created_by / chain.created_by — those are independent).
+# create-audit-tables: true
 `, version)
 	if err := os.WriteFile("sdm.cfg.yaml", []byte(content), 0644); err != nil {
 		return fmt.Errorf("failed to write sdm.cfg.yaml: %w", err)
@@ -381,6 +387,13 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create plugin: %w", err)
 	}
 
+	// Effective generator options. `create-audit-tables` defaults to true
+	// when the YAML key is absent — preserves behavior for configs written
+	// before this knob existed.
+	genOpts := generator.Options{
+		CreateAuditTables: cfg.AuditTablesEnabled(),
+	}
+
 	// Emit sdm_helpers.go once per output directory (≈ Go package). Using a single
 	// "firstFile" only works when all user protos share one package — with two
 	// packages (e.g. invoice/, user/) the second package ends up without helpers,
@@ -390,7 +403,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		if !f.Generate {
 			continue
 		}
-		generator.GenerateFile(gen, f)
+		generator.GenerateFile(gen, f, genOpts)
 		dir := path.Dir(f.GeneratedFilenamePrefix)
 		if !emittedHelpers[dir] {
 			generator.GenerateHelpers(gen, f)

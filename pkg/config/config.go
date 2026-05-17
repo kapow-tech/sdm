@@ -13,6 +13,20 @@ type Config struct {
 	UserProtos []string `yaml:"user-protos"`
 	Output     string   `yaml:"output"`
 	OutputSQL  string   `yaml:"output-sql"`
+	// CreateAuditTables toggles emission of audit_pii_<name>s tables, the
+	// AFTER UPDATE/DELETE trigger, the <Name>PiiAudit Go struct, and the
+	// Repo.AuditLog method. Pointer so a missing YAML key defaults to true
+	// (back-compat with configs written before this knob existed).
+	CreateAuditTables *bool `yaml:"create-audit-tables"`
+}
+
+// AuditTablesEnabled returns the effective value of CreateAuditTables,
+// defaulting to true when unset.
+func (c *Config) AuditTablesEnabled() bool {
+	if c.CreateAuditTables == nil {
+		return true
+	}
+	return *c.CreateAuditTables
 }
 
 func LoadConfig(path string) (*Config, error) {

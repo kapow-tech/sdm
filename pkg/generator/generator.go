@@ -13,19 +13,37 @@ import (
 	sdm "github.com/kapow-tech/sdm/sdmprotos" // Import the generated code for annotations
 )
 
+// Options configures optional generator features.
+//
+// CreateAuditTables controls whether each PII-backed message gets an
+// audit_pii_<name>s table, the AFTER UPDATE/DELETE trigger, the
+// <Name>PiiAudit Go struct, and the Repo.AuditLog method. When false,
+// the actor still flows into pii.created_by / chain.created_by (those
+// columns are independent), but the `sdm.actor` session-variable assignment
+// is skipped — nothing reads it.
+type Options struct {
+	CreateAuditTables bool
+}
+
+// DefaultOptions returns the options used when callers don't supply any —
+// audit tables are emitted by default.
+func DefaultOptions() Options {
+	return Options{CreateAuditTables: true}
+}
+
 // GenerateFile generates the SDM artifacts for a single proto file.
 // After iterating all files, call GenerateHelpers(gen, anyFile) exactly once.
-func GenerateFile(gen *protogen.Plugin, file *protogen.File) {
+func GenerateFile(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	if len(file.Messages) == 0 {
 		return
 	}
 
 	// generate Go models
-	generateModels(gen, file)
+	generateModels(gen, file, opts)
 	// generate SQL schema
-	generateSQL(gen, file)
+	generateSQL(gen, file, opts)
 	// generate GORM repository
-	generateRepo(gen, file)
+	generateRepo(gen, file, opts)
 }
 
 // GenerateHelpers emits sdm_helpers.go exactly once for the whole package.
@@ -278,7 +296,7 @@ func packageHasRepeatedMessageField(gen *protogen.Plugin) bool {
 	return false
 }
 
-func generateModels(gen *protogen.Plugin, file *protogen.File) {
+func generateModels(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	filename := file.GeneratedFilenamePrefix + "_sdm_model.go"
 	g := gen.NewGeneratedFile(filename, file.GoImportPath)
 
@@ -306,7 +324,11 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 	g.P()
 	// datatypes.JSON is used by string fields annotated (sdm.json)=true AND by
 	// every PII-backed message's `<Name>PiiAudit.LastValue` column (jsonb).
-	needDatatypes := fileHasStringJsonField(file) || fileHasPiiBackedMessage(file)
+	// The audit-table contribution is gated by opts.CreateAuditTables — when
+	// audit is off, no PiiAudit struct is emitted so the import isn't needed
+	// solely for that.
+	needDatatypes := fileHasStringJsonField(file) ||
+		(opts.CreateAuditTables && fileHasPiiBackedMessage(file))
 
 	g.P("import (")
 	g.P(`	"time"`)
@@ -327,11 +349,11 @@ func generateModels(gen *protogen.Plugin, file *protogen.File) {
 		if !isSdmRecord(msg) {
 			continue // value-type message (e.g. Money) — used inline as JSON, no tables
 		}
-		generateMessageModels(g, msg)
+		generateMessageModels(g, msg, opts)
 	}
 }
 
-func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
+func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, genOpts Options) {
 	modelName := msg.GoIdent.GoName
 	chainOnly := isChainOnly(msg)
 
@@ -462,8 +484,9 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	// ── PII Audit struct ──────────────────────────────────────────────────────
 	// Mirror of audit_pii_<name>s. The table + trigger are emitted by
 	// generateSQL only for PII-backed messages, so the struct is only emitted
-	// here when !chainOnly.
-	if !chainOnly {
+	// here when !chainOnly. Skipped entirely when audit tables are disabled
+	// via Options.CreateAuditTables=false.
+	if !chainOnly && genOpts.CreateAuditTables {
 		g.P("type ", modelName, "PiiAudit struct {")
 		g.P("  Id         int64          `gorm:\"column:id;primaryKey;autoIncrement\"`")
 		g.P("  RefId      string         `gorm:\"column:ref_id\"`")
@@ -587,7 +610,7 @@ func sqlCompositeKeyExpr(keyCols []string, tableAlias string) string {
 	return strings.Join(parts, " || ':' || ")
 }
 
-func generateSQL(gen *protogen.Plugin, file *protogen.File) {
+func generateSQL(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	filename := file.GeneratedFilenamePrefix + "_sdm_schema.sql"
 	g := gen.NewGeneratedFile(filename, "")
 
@@ -680,59 +703,64 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			// ref_id is TEXT (cast from the PK via ::text) so the same audit
 			// table works for both BIGINT and TEXT primary keys; composite PKs
 			// are joined with ':' to mirror the chain compositeKey scheme.
-			auditTable := fmt.Sprintf("audit_pii_%ss", modelName)
-			auditFn := fmt.Sprintf("audit_pii_%ss_log", modelName)
-			auditTrigger := fmt.Sprintf("audit_pii_%ss_log_trigger", modelName)
-			piiTable := fmt.Sprintf("pii_%ss", modelName)
+			//
+			// Entire block is gated on opts.CreateAuditTables.
+			if opts.CreateAuditTables {
+				auditTable := fmt.Sprintf("audit_pii_%ss", modelName)
+				auditFn := fmt.Sprintf("audit_pii_%ss_log", modelName)
+				auditTrigger := fmt.Sprintf("audit_pii_%ss_log_trigger", modelName)
+				piiTable := fmt.Sprintf("pii_%ss", modelName)
 
-			g.P("CREATE TABLE IF NOT EXISTS ", auditTable, " (")
-			g.P("  id BIGSERIAL PRIMARY KEY,")
-			g.P("  ref_id TEXT NOT NULL,")
-			g.P("  last_value JSONB NOT NULL,")
-			g.P("  change_type TEXT NOT NULL,")
-			g.P("  changed_by TEXT NOT NULL DEFAULT '',")
-			g.P("  changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP")
-			g.P(");")
-			g.P()
+				g.P("CREATE TABLE IF NOT EXISTS ", auditTable, " (")
+				g.P("  id BIGSERIAL PRIMARY KEY,")
+				g.P("  ref_id TEXT NOT NULL,")
+				g.P("  last_value JSONB NOT NULL,")
+				g.P("  change_type TEXT NOT NULL,")
+				g.P("  changed_by TEXT NOT NULL DEFAULT '',")
+				g.P("  changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP")
+				g.P(");")
+				g.P()
 
-			// Compose the ref_id expression. Single-column PK is the common
-			// case (cast to text). Composite PK is joined with ':' to match
-			// chain compositeKey construction.
-			var refIDExpr string
-			switch len(pkCols) {
-			case 0:
-				// Should not happen for PII-backed messages (isSdmRecord requires PK
-				// or chain_identifier_key, and chainOnly is already false here).
-				refIDExpr = "''"
-			case 1:
-				refIDExpr = fmt.Sprintf("OLD.%s::text", pkCols[0])
-			default:
-				parts := make([]string, len(pkCols))
-				for i, c := range pkCols {
-					parts[i] = fmt.Sprintf("OLD.%s::text", c)
+				// Compose the ref_id expression. Single-column PK is the
+				// common case (cast to text). Composite PK is joined with
+				// ':' to match chain compositeKey construction.
+				var refIDExpr string
+				switch len(pkCols) {
+				case 0:
+					// Should not happen for PII-backed messages (isSdmRecord
+					// requires PK or chain_identifier_key, and chainOnly is
+					// already false here).
+					refIDExpr = "''"
+				case 1:
+					refIDExpr = fmt.Sprintf("OLD.%s::text", pkCols[0])
+				default:
+					parts := make([]string, len(pkCols))
+					for i, c := range pkCols {
+						parts[i] = fmt.Sprintf("OLD.%s::text", c)
+					}
+					refIDExpr = strings.Join(parts, " || ':' || ")
 				}
-				refIDExpr = strings.Join(parts, " || ':' || ")
-			}
 
-			g.P("CREATE OR REPLACE FUNCTION ", auditFn, "()")
-			g.P("RETURNS TRIGGER AS $$")
-			g.P("BEGIN")
-			g.P("  INSERT INTO ", auditTable, " (ref_id, last_value, change_type, changed_by)")
-			g.P("  VALUES (")
-			g.P("    ", refIDExpr, ",")
-			g.P("    row_to_json(OLD)::jsonb,")
-			g.P("    TG_OP,")
-			g.P("    COALESCE(current_setting('sdm.actor', true), '')")
-			g.P("  );")
-			g.P("  RETURN NULL;")
-			g.P("END;")
-			g.P("$$ LANGUAGE plpgsql;")
-			g.P()
-			g.P("DROP TRIGGER IF EXISTS ", auditTrigger, " ON ", piiTable, ";")
-			g.P("CREATE TRIGGER ", auditTrigger)
-			g.P("AFTER UPDATE OR DELETE ON ", piiTable)
-			g.P("FOR EACH ROW EXECUTE FUNCTION ", auditFn, "();")
-			g.P()
+				g.P("CREATE OR REPLACE FUNCTION ", auditFn, "()")
+				g.P("RETURNS TRIGGER AS $$")
+				g.P("BEGIN")
+				g.P("  INSERT INTO ", auditTable, " (ref_id, last_value, change_type, changed_by)")
+				g.P("  VALUES (")
+				g.P("    ", refIDExpr, ",")
+				g.P("    row_to_json(OLD)::jsonb,")
+				g.P("    TG_OP,")
+				g.P("    COALESCE(current_setting('sdm.actor', true), '')")
+				g.P("  );")
+				g.P("  RETURN NULL;")
+				g.P("END;")
+				g.P("$$ LANGUAGE plpgsql;")
+				g.P()
+				g.P("DROP TRIGGER IF EXISTS ", auditTrigger, " ON ", piiTable, ";")
+				g.P("CREATE TRIGGER ", auditTrigger)
+				g.P("AFTER UPDATE OR DELETE ON ", piiTable)
+				g.P("FOR EACH ROW EXECUTE FUNCTION ", auditFn, "();")
+				g.P()
+			}
 		}
 
 		// ── Chain Table ───────────────────────────────────────────────────────
@@ -915,7 +943,7 @@ func generateChainOnlyView(g *protogen.GeneratedFile, msg *protogen.Message, mod
 	g.P(";")
 }
 
-func generateRepo(gen *protogen.Plugin, file *protogen.File) {
+func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	filename := file.GeneratedFilenamePrefix + "_sdm_repo.go"
 	g := gen.NewGeneratedFile(filename, file.GoImportPath)
 
@@ -1222,8 +1250,13 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		// Postgres session variable for the current transaction
 		// (`is_local=true`). The audit_pii_<name>s trigger reads the same
 		// variable. Skipped when _actor is empty. Requires emitResolveActor
-		// to have run first.
+		// to have run first. Becomes a no-op when audit tables are disabled
+		// (Options.CreateAuditTables=false) — without a trigger to read the
+		// variable, setting it is pure waste.
 		emitInstallActorSessionVar := func() {
+			if !opts.CreateAuditTables {
+				return
+			}
 			g.P("    if _actor != \"\" {")
 			g.P("      if err := tx.Exec(\"SELECT set_config('sdm.actor', ?, true)\", _actor).Error; err != nil { return err }")
 			g.P("    }")
@@ -1444,29 +1477,33 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			//
 			// Param signature mirrors Fetch's — takes the PK fields. The audit
 			// table's ref_id is the PK joined with ':' for composite PKs.
-			var refIDExpr string
-			if len(whereArgs) == 1 {
-				refIDExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", %s)", whereArgs[0])
-			} else {
-				fmtParts := make([]string, len(whereArgs))
-				for i := range whereArgs {
-					fmtParts[i] = "%v"
+			// Skipped when audit tables are disabled (no <Name>PiiAudit struct
+			// or audit_pii_<name>s table exists in that mode).
+			if opts.CreateAuditTables {
+				var refIDExpr string
+				if len(whereArgs) == 1 {
+					refIDExpr = fmt.Sprintf("fmt.Sprintf(\"%%v\", %s)", whereArgs[0])
+				} else {
+					fmtParts := make([]string, len(whereArgs))
+					for i := range whereArgs {
+						fmtParts[i] = "%v"
+					}
+					refIDExpr = fmt.Sprintf("fmt.Sprintf(\"%s\", %s)",
+						strings.Join(fmtParts, ":"), strings.Join(whereArgs, ", "))
 				}
-				refIDExpr = fmt.Sprintf("fmt.Sprintf(\"%s\", %s)",
-					strings.Join(fmtParts, ":"), strings.Join(whereArgs, ", "))
+				g.P("func (r *", modelName, "Repo) AuditLog(ctx context.Context, ",
+					strings.Join(fetchParams, ", "), ") ([]", modelName, "PiiAudit, error) {")
+				g.P("  var rows []", modelName, "PiiAudit")
+				g.P("  if err := r.db.WithContext(ctx).")
+				g.P("    Where(\"ref_id = ?\", ", refIDExpr, ").")
+				g.P("    Order(\"changed_at ASC, id ASC\").")
+				g.P("    Find(&rows).Error; err != nil {")
+				g.P("    return nil, err")
+				g.P("  }")
+				g.P("  return rows, nil")
+				g.P("}")
+				g.P()
 			}
-			g.P("func (r *", modelName, "Repo) AuditLog(ctx context.Context, ",
-				strings.Join(fetchParams, ", "), ") ([]", modelName, "PiiAudit, error) {")
-			g.P("  var rows []", modelName, "PiiAudit")
-			g.P("  if err := r.db.WithContext(ctx).")
-			g.P("    Where(\"ref_id = ?\", ", refIDExpr, ").")
-			g.P("    Order(\"changed_at ASC, id ASC\").")
-			g.P("    Find(&rows).Error; err != nil {")
-			g.P("    return nil, err")
-			g.P("  }")
-			g.P("  return rows, nil")
-			g.P("}")
-			g.P()
 		}
 
 		// ── ChangeLog ────────────────────────────────────────────────────────
