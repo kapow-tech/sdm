@@ -4,9 +4,9 @@ SDM is a Go toolset for separating sensitive data (PII) from append-only chain
 data using Protobuf annotations. From a single annotated `.proto` file it
 generates:
 
-- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`) plus a `View.AsBaseModel()` converter
-- PostgreSQL DDL (PII table, chain table, combined view, version trigger)
-- A type-safe repository (`Save`, `SaveAll`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`, `ChangeLog`)
+- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`, `{Name}PiiAudit`) plus a `View.AsBaseModel()` converter
+- PostgreSQL DDL (PII table, chain table, audit table + trigger, combined view, version trigger)
+- A type-safe repository (`Save`, `SaveAll`, `SaveChain`, `Fetch`, `FetchBy{Unique}`, `Exists`, `ExistsBy{Unique}`, `ChangeLog`, `AuditLog`)
 
 A runnable end-to-end demo lives at
 [sdm-tool/sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
@@ -95,6 +95,60 @@ type ChangeLog map[string]map[int64]ChangeLogEntry // field_name → version →
 
 Soft-deleted PII rows do **not** mask chain history — chain entries persist
 independently. Returns `gorm.ErrRecordNotFound` when the key has no chain rows.
+
+### PII audit log
+
+Every PII table gets a sibling `audit_pii_{name}s` table plus an
+`AFTER UPDATE OR DELETE` trigger that captures the row as it existed BEFORE
+each change. `INSERT` is not audited — the chain table already records the
+newly-introduced values.
+
+Schema:
+
+```sql
+CREATE TABLE audit_pii_users (
+  id BIGSERIAL PRIMARY KEY,
+  ref_id TEXT NOT NULL,                          -- PK as text (composite PKs joined with ':')
+  last_value JSONB NOT NULL,                     -- row_to_json(OLD)
+  change_type TEXT NOT NULL,                     -- 'UPDATE' or 'DELETE' (TG_OP)
+  changed_by TEXT NOT NULL DEFAULT '',           -- from session var sdm.changed_by
+  changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Attributing the change to a user** — wrap the context with
+`{pkg}.WithChangedBy(ctx, who)`. The generated `Save` / `SaveAll` methods
+run `SELECT set_config('sdm.changed_by', $1, true)` inside the same
+transaction as the PII write; the trigger reads it via
+`current_setting('sdm.changed_by', true)`. Because `SET LOCAL` (via
+`set_config(..., true)`) is transaction-scoped, the attribution does not
+leak between requests.
+
+```go
+ctx := user.WithChangedBy(context.Background(), "alice@example.com")
+repo.SaveAll(ctx, u, true) // audit row's changed_by = "alice@example.com"
+```
+
+Changes made through paths that bypass `Save` / `SaveAll` — raw
+`db.Exec(...)`, `db.Delete(...)` outside a generated transaction — record
+an empty `changed_by`. To attribute those, set the session variable yourself
+inside your own transaction.
+
+**Reading the history** — `repo.AuditLog(ctx, pk)` returns
+`[]{Name}PiiAudit` in chronological order:
+
+```go
+rows, _ := userRepo.AuditLog(ctx, u.Id)
+for _, r := range rows {
+    fmt.Printf("%s by %s at %s: %s\n",
+        r.ChangeType, r.ChangedBy, r.ChangedAt, string(r.LastValue))
+}
+```
+
+GORM soft-deletes (`db.Delete(&pii)` when the struct has
+`gorm.DeletedAt`) appear as `change_type = 'UPDATE'` because the underlying
+SQL is `UPDATE … SET deleted_at = NOW()`. Hard deletes
+(`db.Unscoped().Delete(...)`) appear as `'DELETE'`.
 
 ### View → base model
 
@@ -299,6 +353,11 @@ buf generate
 - **`pii_{name}s`** — primary key, PII / query-index / FK columns, plus the
   three audit columns (all `TIMESTAMP WITH TIME ZONE`). Soft-deleted rows
   have non-NULL `deleted_at`.
+- **`audit_pii_{name}s`** — `(id, ref_id, last_value, change_type, changed_by, changed_at)`.
+  Populated by the `audit_pii_{name}s_log_trigger` `AFTER UPDATE OR DELETE`
+  trigger on `pii_{name}s`. `last_value` is `row_to_json(OLD)::jsonb`;
+  `change_type` is the trigger's `TG_OP`; `changed_by` reads from the
+  `sdm.changed_by` Postgres session variable.
 - **`chain_{name}s`** — `(key, field_name, version, tx_hash, field_value, created_at)`.
   `created_at` is `TIMESTAMP WITH TIME ZONE`. The `version` is auto-assigned
   per `(key, field_name)` by the `chain_{name}s_set_version_trigger`
@@ -320,6 +379,7 @@ buf generate
 | `FetchBy{Unique}` | Generated for every `(sdm.unique)` field. |
 | `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the same soft-delete filter. |
 | `ChangeLog(ctx, key)` | Returns the full per-field version history as `map[field_name]map[version]{Value, Timestamp}`. Returns `gorm.ErrRecordNotFound` if no chain rows exist. |
+| `AuditLog(ctx, pk)` | Returns the audit_pii_*** rows (`[]{Name}PiiAudit`) for one PII record, oldest first. Each row carries `LastValue` (OLD as JSONB), `ChangeType` ('UPDATE'/'DELETE'), `ChangedBy` (from `WithChangedBy` context), and `ChangedAt`. |
 
 ### View methods
 
