@@ -55,7 +55,7 @@ func GenerateHelpers(gen *protogen.Plugin, file *protogen.File) {
 	if needEncodingJson {
 		g.P(`	"encoding/json"`)
 	}
-	// `context` is always needed: WithChangedBy / changedByFromContext use it.
+	// `context` is always needed: WithActor / actorFromContext use it.
 	g.P(`	"context"`)
 	g.P(`	"strings"`)
 	g.P(`	"time"`)
@@ -89,26 +89,30 @@ func GenerateHelpers(gen *protogen.Plugin, file *protogen.File) {
 	g.P("// table's BEFORE INSERT trigger.")
 	g.P("type ChangeLog map[string]map[int64]ChangeLogEntry")
 	g.P()
-	g.P("// changedByKey is the context key carrying the user identifier that the")
-	g.P("// audit_pii_<name>s trigger will record as `changed_by`. Unexported so")
-	g.P("// callers must go through WithChangedBy / changedByFromContext.")
-	g.P("type changedByKey struct{}")
+	g.P("// actorKey is the context key carrying the actor identifier that")
+	g.P("// populates created_by on PII rows, created_by on chain rows, and")
+	g.P("// changed_by on audit rows (via the AFTER UPDATE/DELETE trigger).")
+	g.P("// Unexported so callers must go through WithActor / actorFromContext.")
+	g.P("type actorKey struct{}")
 	g.P()
-	g.P("// WithChangedBy returns a derived context that propagates `who` to the")
-	g.P("// audit_pii_<name>s.changed_by column for any PII mutation made through")
-	g.P("// the generated Save / SaveAll methods. The repo sets the Postgres")
-	g.P("// session variable `sdm.changed_by` at the start of the same transaction")
-	g.P("// as the write, scoping the attribution to that transaction. Reads,")
-	g.P("// SaveChain, and direct GORM operations (db.Delete / db.Exec) that do")
-	g.P("// not pass through Save / SaveAll record '' for changed_by.")
-	g.P("func WithChangedBy(ctx context.Context, who string) context.Context {")
-	g.P("  return context.WithValue(ctx, changedByKey{}, who)")
+	g.P("// WithActor returns a derived context that propagates the actor")
+	g.P("// identifier to any PII mutation made through the generated")
+	g.P("// Save / SaveAll / SaveChain methods. Inside the same transaction")
+	g.P("// as the write the repo sets the Postgres session variable")
+	g.P("// `sdm.actor` from this value (scoping the attribution to that")
+	g.P("// transaction) AND assigns it to the created_by column on INSERT.")
+	g.P("// The AFTER UPDATE/DELETE trigger reads the same session variable")
+	g.P("// to populate audit_pii_<name>s.changed_by. Direct GORM operations")
+	g.P("// (db.Exec / db.Delete) that do not pass through Save / SaveAll")
+	g.P("// record '' for changed_by.")
+	g.P("func WithActor(ctx context.Context, actorID string) context.Context {")
+	g.P("  return context.WithValue(ctx, actorKey{}, actorID)")
 	g.P("}")
 	g.P()
-	g.P("// changedByFromContext extracts the user identifier installed by")
-	g.P("// WithChangedBy, or \"\" if absent. Used by generated repo methods.")
-	g.P("func changedByFromContext(ctx context.Context) string {")
-	g.P("  if v, ok := ctx.Value(changedByKey{}).(string); ok { return v }")
+	g.P("// actorFromContext extracts the actor identifier installed by")
+	g.P("// WithActor, or \"\" if absent. Used by generated repo methods.")
+	g.P("func actorFromContext(ctx context.Context) string {")
+	g.P("  if v, ok := ctx.Value(actorKey{}).(string); ok { return v }")
 	g.P("  return \"\"")
 	g.P("}")
 	if needProtojson {
@@ -373,20 +377,22 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 		}
 		// Audit columns — always present on every PII table.
 		// DeletedAt uses gorm.DeletedAt so GORM's soft-delete scope applies automatically.
-		// CreatedBy/UpdatedBy capture the actor (repo.WithActor or WithChangedBy ctx);
-		// CreatedBy is preserved on upserts, UpdatedBy is rebumped to the latest actor.
+		// CreatedBy captures the actor at INSERT (from WithActor(ctx, …))
+		// and is preserved across upserts. "Who last updated this row" is
+		// not stored here — read it from the latest audit_pii_<name>s row,
+		// which the AFTER UPDATE trigger writes from the same `sdm.actor`
+		// session variable.
 		g.P("CreatedAt time.Time `gorm:\"column:created_at\"`")
 		g.P("UpdatedAt time.Time `gorm:\"column:updated_at\"`")
 		g.P("DeletedAt gorm.DeletedAt `gorm:\"column:deleted_at\"`")
 		g.P("CreatedBy string `gorm:\"column:created_by\"`")
-		g.P("UpdatedBy string `gorm:\"column:updated_by\"`")
 		g.P("}")
 		g.P()
 	}
 
 	// ── Chain Table Structure ─────────────────────────────────────────────────
 	// Chain rows are append-only, so the only actor column is CreatedBy
-	// (populated from repo.WithActor or WithChangedBy ctx at insert time).
+	// (populated from WithActor(ctx, …) at insert time).
 	g.P("type ", modelName, "Chain struct {")
 	g.P("Key string `gorm:\"primaryKey;column:key\"`")
 	g.P("FieldName string `gorm:\"primaryKey;column:field_name\"`")
@@ -435,12 +441,12 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message) {
 	// DeletedAt uses gorm.DeletedAt so GORM's soft-delete scope also applies
 	// to view queries (a redundant safety net; read methods also emit an
 	// explicit `deleted_at IS NULL` filter for clarity).
-	// CreatedBy/UpdatedBy record the actor at insert/last-update time.
+	// CreatedBy is the actor at INSERT; "who last updated" is intentionally
+	// not exposed here — query audit_pii_<name>s for that.
 	g.P("CreatedAt time.Time `gorm:\"column:created_at\"`")
 	g.P("UpdatedAt time.Time `gorm:\"column:updated_at\"`")
 	g.P("DeletedAt gorm.DeletedAt `gorm:\"column:deleted_at\"`")
 	g.P("CreatedBy string `gorm:\"column:created_by\"`")
-	g.P("UpdatedBy string `gorm:\"column:updated_by\"`")
 	g.P("TxHash string `gorm:\"column:tx_hash\"`")
 	g.P("}")
 	g.P()
@@ -624,14 +630,15 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			// Audit columns — always present on every PII table.
 			// deleted_at is nullable: NULL means the row is live; non-NULL means soft-deleted.
 			// TZ-aware so timestamps remain correct across host/server tz drift.
-			// created_by / updated_by are populated from the resolved actor
-			// (repo.WithActor wins; falls back to WithChangedBy ctx; else '').
-			// created_by is preserved on upserts; updated_by is rebumped.
+			// created_by is populated from the actor on the request ctx at
+			// INSERT (WithActor(ctx, actorID); else ''); preserved across
+			// upserts. "Who updated this row" is captured per-change in
+			// audit_pii_<name>s.changed_by — no row-level updated_by column
+			// is stored.
 			g.P("  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,")
 			g.P("  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,")
 			g.P("  deleted_at TIMESTAMP WITH TIME ZONE NULL,")
 			g.P("  created_by TEXT NOT NULL DEFAULT '',")
-			g.P("  updated_by TEXT NOT NULL DEFAULT '',")
 
 			type constraint struct{ line string }
 			var constraints []constraint
@@ -663,10 +670,10 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			// UPDATE or DELETE against pii_<name>s. INSERTs aren't audited —
 			// the chain table already records the newly-introduced values.
 			//
-			// changed_by reads from the `sdm.changed_by` Postgres session
+			// changed_by reads from the `sdm.actor` Postgres session
 			// variable. The generated Save / SaveAll methods set that variable
 			// inside their transaction when the context carries a value via
-			// WithChangedBy(ctx, who). Changes made through other paths
+			// WithActor(ctx, actorID). Changes made through other paths
 			// (raw db.Exec, db.Delete outside a SaveAll transaction) record
 			// '' for changed_by.
 			//
@@ -715,7 +722,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File) {
 			g.P("    ", refIDExpr, ",")
 			g.P("    row_to_json(OLD)::jsonb,")
 			g.P("    TG_OP,")
-			g.P("    COALESCE(current_setting('sdm.changed_by', true), '')")
+			g.P("    COALESCE(current_setting('sdm.actor', true), '')")
 			g.P("  );")
 			g.P("  RETURN NULL;")
 			g.P("END;")
@@ -823,11 +830,12 @@ func generatePiiBackedView(g *protogen.GeneratedFile, msg *protogen.Message, mod
 	// (nullable timestamptz); the view does not compute a boolean — GORM's
 	// gorm.DeletedAt type on the View struct, plus an explicit
 	// `WHERE deleted_at IS NULL` in read methods, handle the filtering.
+	// Only created_by is surfaced; for "who last updated" callers query
+	// audit_pii_<name>s directly (Repo.AuditLog).
 	selects = append(selects, "p.created_at")
 	selects = append(selects, "p.updated_at")
 	selects = append(selects, "p.deleted_at")
 	selects = append(selects, "p.created_by")
-	selects = append(selects, "p.updated_by")
 
 	// Latest tx_hash from the chain table for this record.
 	joins = append(joins, fmt.Sprintf(
@@ -978,38 +986,16 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 		modelName := msg.GoIdent.GoName
 		chainOnly := isChainOnly(msg)
 
-		// Repo struct. `actor` is the repo-scoped actor identifier installed via
-		// WithActor; it takes precedence over any value carried by ctx via
-		// WithChangedBy. Empty string means "no repo-level actor; fall back to ctx".
+		// Repo struct. The actor identifier for audit attribution flows
+		// exclusively via ctx (see WithActor / actorFromContext); the repo
+		// stays a pure data-access layer with no per-call mutable state.
 		g.P("type ", modelName, "Repo struct {")
-		g.P("  db    *gorm.DB")
-		g.P("  actor string")
+		g.P("  db *gorm.DB")
 		g.P("}")
 		g.P()
 
 		g.P("func New", modelName, "Repo(db *gorm.DB) *", modelName, "Repo {")
 		g.P("  return &", modelName, "Repo{db: db}")
-		g.P("}")
-		g.P()
-
-		// WithActor returns a shallow copy of the repo with the given actor
-		// identifier bound. The actor populates created_by / updated_by on the
-		// PII row, created_by on each chain row appended, and changed_by on
-		// audit rows produced by the trigger. Repo-level actor wins over any
-		// ctx value installed via WithChangedBy.
-		g.P("func (r *", modelName, "Repo) WithActor(actorID string) *", modelName, "Repo {")
-		g.P("  cp := *r")
-		g.P("  cp.actor = actorID")
-		g.P("  return &cp")
-		g.P("}")
-		g.P()
-
-		// resolveActor returns the actor identifier to use for the current
-		// mutation. Precedence: repo-level (WithActor) > ctx (WithChangedBy)
-		// > empty string.
-		g.P("func (r *", modelName, "Repo) resolveActor(ctx context.Context) string {")
-		g.P("  if r.actor != \"\" { return r.actor }")
-		g.P("  return changedByFromContext(ctx)")
 		g.P("}")
 		g.P()
 
@@ -1113,11 +1099,12 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 					g.P("      ", field.GoName, ": model.", field.GoName, ",")
 				}
 			}
-			// Actor columns. On INSERT both are written; on conflict-UPDATE only
-			// updated_by is in the assignment set (see updatableSqlCols), so the
-			// original created_by survives.
+			// Actor column. Set on every INSERT; not in the conflict-UPDATE
+			// assignment set (see updatableSqlCols) so the original creator is
+			// preserved across upserts. The per-update actor lives in
+			// audit_pii_<name>s.changed_by, written by the AFTER UPDATE trigger
+			// from the same `sdm.actor` session variable.
 			g.P("      CreatedBy: _actor,")
-			g.P("      UpdatedBy: _actor,")
 			g.P("    }")
 		}
 
@@ -1222,23 +1209,23 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File) {
 			}
 		}
 
-		// emitResolveActor binds the resolved actor identifier to the local
-		// `_actor` variable inside the transaction lambda. The variable is
-		// always defined (empty string if no actor configured) so downstream
-		// emit blocks (emitPiiStruct, emitChainEntries) can reference it
-		// unconditionally. resolveActor's precedence: WithActor > ctx > "".
+		// emitResolveActor binds the ctx-carried actor identifier to the
+		// local `_actor` variable inside the transaction lambda. The
+		// variable is always defined (empty string when no actor is on the
+		// ctx) so downstream emit blocks (emitPiiStruct, emitChainEntries)
+		// can reference it unconditionally.
 		emitResolveActor := func() {
-			g.P("    _actor := r.resolveActor(ctx)")
+			g.P("    _actor := actorFromContext(ctx)")
 		}
 
-		// emitInstallActorSessionVar installs `_actor` into the
-		// `sdm.changed_by` Postgres session variable for the current
-		// transaction (`is_local=true`). The audit_pii_<name>s trigger reads
-		// the same variable. Skipped when _actor is empty. Requires
-		// emitResolveActor to have run first.
+		// emitInstallActorSessionVar installs `_actor` into the `sdm.actor`
+		// Postgres session variable for the current transaction
+		// (`is_local=true`). The audit_pii_<name>s trigger reads the same
+		// variable. Skipped when _actor is empty. Requires emitResolveActor
+		// to have run first.
 		emitInstallActorSessionVar := func() {
 			g.P("    if _actor != \"\" {")
-			g.P("      if err := tx.Exec(\"SELECT set_config('sdm.changed_by', ?, true)\", _actor).Error; err != nil { return err }")
+			g.P("      if err := tx.Exec(\"SELECT set_config('sdm.actor', ?, true)\", _actor).Error; err != nil { return err }")
 			g.P("    }")
 		}
 
@@ -1801,15 +1788,16 @@ func fileHasRepeatedMessageField(file *protogen.File) bool {
 // updatableSqlCols returns the SQL column names that Upsert/Update mutate on
 // the PII table. Excludes: PK, auto_increment, chain_identifier_key (the
 // natural lookup key is immutable), and audit columns the DB manages. Always
-// appends "updated_at" and "updated_by" so callers can rebump them on conflict.
-// "created_at" and "created_by" are intentionally NOT in the update set —
-// they're preserved from the original insert across upserts.
+// appends "updated_at" so callers can rebump it on conflict. "created_at"
+// and "created_by" are intentionally NOT in the update set — they're
+// preserved from the original insert across upserts. There's no
+// "updated_by" column; per-update actor lives in audit_pii_<name>s.
 func updatableSqlCols(msg *protogen.Message) []string {
 	var cols []string
 	for _, f := range updatableGoFields(msg) {
 		cols = append(cols, string(f.Desc.Name()))
 	}
-	cols = append(cols, "updated_at", "updated_by")
+	cols = append(cols, "updated_at")
 	return cols
 }
 
