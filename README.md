@@ -35,11 +35,16 @@ A runnable end-to-end demo lives at
 | `string` + `(sdm.json) = true` | `datatypes.JSON` | Raw JSON text | `datatypes.JSON` |
 | `google.protobuf.Timestamp` | `time.Time` (via `.AsTime()`) | `time.RFC3339Nano` text (view casts back via `::timestamptz`) | `time.Time` |
 | Nested `MessageType` | `*MessageType` (with `serializer:protojson`) | `protojson.Marshal(...)` | `*MessageType` (auto-decoded by serializer) |
-| `repeated string` | (not allowed in PII) | `pgArrayLiteral` → `{a,b,c}` | `pq.StringArray` (`text[]`) |
-| `repeated MessageType` | (not allowed in PII) | JSON array, element-wise protojson | `datatypes.JSON` (`jsonb`) |
+| `repeated string` | `pq.StringArray` (`text[]`) | `pgArrayLiteral` → `{a,b,c}` | `pq.StringArray` (`text[]`) |
+| `repeated MessageType` | `[]*MessageType` (with `serializer:protojsonArray`, stored `jsonb`) | JSON array, element-wise protojson | `[]*MessageType` (auto-decoded by serializer) |
 
 Postgres `timestamptz` has microsecond precision (6 fractional digits) — `time.Time`
 values with nanosecond precision get truncated on round-trip.
+
+The `protojsonArray` serializer (auto-emitted in `sdm_helpers.go` when any
+recorded message has a `repeated MessageType` field) handles
+`[]*MessageType ↔ JSON array bytes` for both the PII column and the View
+column. Empty / nil slices round-trip as the literal `[]`.
 
 ### Baked-in audit + soft-delete
 
