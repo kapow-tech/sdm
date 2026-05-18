@@ -55,7 +55,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// deleted_at is nullable: NULL means the row is live; non-NULL means soft-deleted.
 			// TZ-aware so timestamps remain correct across host/server tz drift.
 			// created_by is populated from the actor on the request ctx at
-			// INSERT (WithActor(ctx, actorID); else ''); preserved across
+			// INSERT (sdm.CtxWithActor(ctx, actorID); else ''); preserved across
 			// upserts. "Who updated this row" is captured per-change in
 			// audit_pii_<name>s.changed_by — no row-level updated_by column
 			// is stored.
@@ -97,7 +97,7 @@ func generateSQL(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// changed_by reads from the `sdm.actor` Postgres session
 			// variable. The generated Save / SaveAll methods set that variable
 			// inside their transaction when the context carries a value via
-			// WithActor(ctx, actorID). Changes made through other paths
+			// sdm.CtxWithActor(ctx, actorID). Changes made through other paths
 			// (raw db.Exec, db.Delete outside a SaveAll transaction) record
 			// '' for changed_by.
 			//
