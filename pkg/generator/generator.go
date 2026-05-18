@@ -1721,8 +1721,13 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			g.P("func (r *", modelName, "Repo) CommitChain(ctx context.Context, ",
 				strings.Join(chainKeyParams, ", "), ", txHash string) error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
-			emitResolveActor()
-			emitInstallActorSessionVar()
+			// _actor is only consumed by the audit session-var install (the
+			// chain UPDATE itself doesn't reference it). Skip emitting it
+			// when audit is off so the generated code stays compilable.
+			if opts.CreateAuditTables {
+				emitResolveActor()
+				emitInstallActorSessionVar()
+			}
 			g.P("    _key := ", chainKeyExprStandalone)
 			g.P("    return tx.Model(&", modelName, "Chain{}).")
 			g.P("      Where(\"key = ? AND status = ?\", _key, \"DRAFTED\").")
@@ -1743,8 +1748,12 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			g.P("func (r *", modelName, "Repo) DropChain(ctx context.Context, ",
 				strings.Join(chainKeyParams, ", "), ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
-			emitResolveActor()
-			emitInstallActorSessionVar()
+			// Same as CommitChain: _actor is only consumed by the audit
+			// session-var install. Skip when audit is off.
+			if opts.CreateAuditTables {
+				emitResolveActor()
+				emitInstallActorSessionVar()
+			}
 			g.P("    _key := ", chainKeyExprStandalone)
 			g.P("    return tx.Model(&", modelName, "Chain{}).")
 			g.P("      Where(\"key = ? AND status = ?\", _key, \"DRAFTED\").")
