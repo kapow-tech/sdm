@@ -386,6 +386,13 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 
 	// ── PII Table Structure (skipped for chain-only messages) ────────────────
 	if !chainOnly {
+		g.P("// ", modelName, "Pii is the GORM model for table pii_", strings.ToLower(modelName), "s — the")
+		g.P("// storage for fields marked (sdm.pii), plus the primary key, foreign")
+		g.P("// keys, and audit columns (CreatedAt / UpdatedAt / DeletedAt / CreatedBy).")
+		g.P("// Mutations should flow through the generated Create / Upsert / Update /")
+		g.P("// SaveAll methods on ", modelName, "Repo — direct GORM writes bypass chain")
+		g.P("// bookkeeping and actor attribution. DeletedAt is gorm.DeletedAt, so")
+		g.P("// GORM's soft-delete scope applies automatically.")
 		g.P("type ", modelName, "Pii struct {")
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
@@ -446,6 +453,13 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 	// (DRAFTED / CREATED / DROPPED). New rows are written as DRAFTED by
 	// DraftChain and promoted to CREATED by CommitChain or DROPPED by
 	// DropChain. Legal transitions are enforced by a BEFORE UPDATE trigger.
+	g.P("// ", modelName, "Chain is the GORM model for table chain_", strings.ToLower(modelName), "s — the")
+	g.P("// append-only per-field history. Each row records a single")
+	g.P("// (key, field_name, version) triple with the value at that version and")
+	g.P("// the actor that wrote it. Version is auto-assigned by a BEFORE INSERT")
+	g.P("// trigger (1-based, per (key, field_name)). With chain-drafts enabled,")
+	g.P("// rows also carry a Status (DRAFTED / CREATED / DROPPED); state")
+	g.P("// transitions are guarded by a BEFORE UPDATE trigger.")
 	g.P("type ", modelName, "Chain struct {")
 	g.P("Key string `gorm:\"primaryKey;column:key\"`")
 	g.P("FieldName string `gorm:\"primaryKey;column:field_name\"`")
@@ -465,6 +479,14 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 	// repeated message fields use []*Message via protojsonArray serializer —
 	// the underlying column is JSONB (chain TEXT cast to ::jsonb in the view,
 	// or PII's native JSONB column) and the serializer decodes per-element.
+	g.P("// ", modelName, "View is the read model returned by Fetch / FetchBy*. It joins")
+	g.P("// the latest committed value of every chain field with the PII row,")
+	g.P("// surfaces hashed_* sidecar columns, and (with chain-drafts enabled)")
+	g.P("// exposes HasPendingDrafts to signal that an uncommitted edit exists.")
+	g.P("//")
+	g.P("// Maps to view ", strings.ToLower(modelName), "s by default; with chain-drafts enabled, the")
+	g.P("// repo's Fetch methods route to ", strings.ToLower(modelName), "s_with_drafts when called with")
+	g.P("// drafted=true (the overlay shows uncommitted DRAFTED values).")
 	g.P("type ", modelName, "View struct {")
 	for _, field := range msg.Fields {
 		var goType, viewTag string
@@ -515,9 +537,14 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 
 	// ── TableName overrides ───────────────────────────────────────────────────
 	if !chainOnly {
+		g.P("// TableName returns the SQL table name backing ", modelName, "Pii.")
 		g.P("func (", modelName, "Pii) TableName() string { return \"pii_", strings.ToLower(modelName), "s\" }")
 	}
+	g.P("// TableName returns the SQL table name backing ", modelName, "Chain.")
 	g.P("func (", modelName, "Chain) TableName() string { return \"chain_", strings.ToLower(modelName), "s\" }")
+	g.P("// TableName returns the default (committed-only) view name. With chain-drafts")
+	g.P("// enabled, the repo's Fetch methods may route to ", strings.ToLower(modelName), "s_with_drafts via .Table()")
+	g.P("// when drafted=true, bypassing this default.")
 	g.P("func (", modelName, "View) TableName() string { return \"", strings.ToLower(modelName), "s\" }")
 	g.P()
 
@@ -527,6 +554,13 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 	// here when !chainOnly. Skipped entirely when audit tables are disabled
 	// via Options.CreateAuditTables=false.
 	if !chainOnly && genOpts.CreateAuditTables {
+		g.P("// ", modelName, "PiiAudit is the GORM model for audit_pii_", strings.ToLower(modelName), "s — a per-row")
+		g.P("// snapshot taken by the AFTER UPDATE/DELETE trigger immediately BEFORE")
+		g.P("// each mutation. LastValue is the full PII row at the moment of capture")
+		g.P("// (JSONB). ChangeType is 'UPDATE' or 'DELETE'; INSERTs do not produce")
+		g.P("// audit rows. ChangedBy is the actor read from the `sdm.actor` Postgres")
+		g.P("// session variable installed by the repo (see WithActor); direct GORM")
+		g.P("// writes that do not pass through the repo record '' there.")
 		g.P("type ", modelName, "PiiAudit struct {")
 		g.P("  Id         int64          `gorm:\"column:id;primaryKey;autoIncrement\"`")
 		g.P("  RefId      string         `gorm:\"column:ref_id\"`")
@@ -536,11 +570,16 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 		g.P("  ChangedAt  time.Time      `gorm:\"column:changed_at\"`")
 		g.P("}")
 		g.P()
+		g.P("// TableName returns the SQL table name backing ", modelName, "PiiAudit.")
 		g.P("func (", modelName, "PiiAudit) TableName() string { return \"audit_pii_", strings.ToLower(modelName), "s\" }")
 		g.P()
 	}
 
 	// ── EnsureUnique method ───────────────────────────────────────────────────
+	g.P("// EnsureUnique reports whether no other chain row has the same")
+	g.P("// (FieldName, FieldValue) — a uniqueness probe for callers that want to")
+	g.P("// enforce global uniqueness of a specific chain value before staging or")
+	g.P("// committing it. Returns false if the query errors.")
 	g.P("func (c *", modelName, "Chain) EnsureUnique(tx *gorm.DB) bool {")
 	g.P("  var count int64")
 	g.P("  err := tx.Model(&", modelName, "Chain{}).Where(\"field_name = ? AND field_value = ?\", c.FieldName, c.FieldValue).Count(&count).Error")
@@ -565,6 +604,14 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 	//   - (sdm.json)=true str : datatypes.JSON → string
 	//   - repeated scalar     : pq.StringArray → []string
 	//   - repeated *Message   : direct assignment ([]*Message via protojsonArray serializer)
+	g.P("// AsBaseModel converts the view back to a base proto ", modelName, " — useful for")
+	g.P("// re-saving (View → AsBaseModel → mutate → Upsert/Update/SaveAll). Audit")
+	g.P("// columns (CreatedAt / UpdatedAt / DeletedAt / TxHash / CreatedBy) and")
+	g.P("// hashed_* sidecars are not copied; they have no counterpart on the base")
+	g.P("// proto. Per-field: Timestamps become *timestamppb.Timestamp (skipped if")
+	g.P("// zero), repeated scalars (pq.StringArray) become []string, JSON sidecars")
+	g.P("// (datatypes.JSON) become string, and singular/repeated messages are")
+	g.P("// passed through (the serializers already decoded them on the View).")
 	g.P("func (v *", modelName, "View) AsBaseModel() *", modelName, " {")
 	g.P("  base := &", modelName, "{}")
 	for _, field := range msg.Fields {
@@ -1169,11 +1216,18 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 		// Repo struct. The actor identifier for audit attribution flows
 		// exclusively via ctx (see WithActor / actorFromContext); the repo
 		// stays a pure data-access layer with no per-call mutable state.
+		g.P("// ", modelName, "Repo is the data-access handle for ", modelName, ". The actor")
+		g.P("// identifier used for audit attribution flows via ctx (see WithActor);")
+		g.P("// the repo is stateless and safe for concurrent use by multiple goroutines.")
 		g.P("type ", modelName, "Repo struct {")
 		g.P("  db *gorm.DB")
 		g.P("}")
 		g.P()
 
+		g.P("// New", modelName, "Repo returns a repo bound to db. Pass a *gorm.DB configured")
+		g.P("// against the same database the generated schema was applied to. Sharing")
+		g.P("// a single *gorm.DB across goroutines is fine — GORM's connection pool")
+		g.P("// handles per-call isolation.")
 		g.P("func New", modelName, "Repo(db *gorm.DB) *", modelName, "Repo {")
 		g.P("  return &", modelName, "Repo{db: db}")
 		g.P("}")
@@ -1486,6 +1540,24 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// visible from the committed view; callers must CommitChain to
 			// promote them. ErrPendingDraftExists surfaces if any chain
 			// field already has a pending DRAFTED row for this key.
+			g.P("// Create inserts a new PII row strictly — PK / unique-index violations")
+			g.P("// surface as the driver-native error (e.g. *pgconn.PgError SQLSTATE")
+			g.P("// 23505), not an upsert. Auto-increment PKs are copied back onto the")
+			g.P("// passed model.")
+			if opts.ChainDrafts {
+				g.P("//")
+				g.P("// chain-drafts ON: in the same transaction, every chain-stored field")
+				g.P("// (and any hashed sidecars) is written as a DRAFTED chain row. Those")
+				g.P("// rows are NOT yet visible in the committed view — callers must call")
+				g.P("// CommitChain(...) to promote them, or DropChain(...) to discard.")
+				g.P("// ErrPendingDraftExists is returned if any chain field already has a")
+				g.P("// DRAFTED row for this key.")
+			} else {
+				g.P("//")
+				g.P("// chain-drafts OFF: writes the PII row only. Pair with SaveAll(_, true)")
+				g.P("// (or use SaveAll directly with the upsert semantics) when you also")
+				g.P("// want chain history appended.")
+			}
 			g.P("func (r *", modelName, "Repo) Create(ctx context.Context, model *", modelName, ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 			emitResolveActor()
@@ -1514,6 +1586,14 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// For chain-only messages the PII step is a no-op; behavior
 			// collapses to a chain-only append when withChain=true, or a
 			// no-op when withChain=false.
+			g.P("// SaveAll upserts the PII row (INSERT on miss, UPDATE on conflict against")
+			g.P("// the chain identifier key for the mutable columns) and, when")
+			g.P("// withChain=true, appends new chain versions for every chain-stored")
+			g.P("// field whose value differs from the latest stored value (skip-if-")
+			g.P("// unchanged per field). Chain rows are written with the column default")
+			g.P("// status (CREATED) — they are immediately visible from Fetch / FetchBy*.")
+			g.P("// For chain-only messages the PII step is skipped: withChain=true")
+			g.P("// collapses to a chain-only append, withChain=false is a no-op.")
 			g.P("func (r *", modelName, "Repo) SaveAll(ctx context.Context, model *", modelName, ", withChain bool) error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 			emitResolveActor()
@@ -1547,6 +1627,13 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// + DraftChain. Same shape as today's SaveAll(_, true) but the
 			// chain rows are written as DRAFTED, not CREATED — caller must
 			// CommitChain to publish them.
+			g.P("// Upsert is the chain-drafts equivalent of SaveAll: PII INSERT on miss")
+			g.P("// or UPDATE on conflict against the chain identifier key (mutable")
+			g.P("// columns only), followed by DraftChain in the same transaction.")
+			g.P("// Chain rows are written as DRAFTED — they are NOT visible in the")
+			g.P("// committed view until CommitChain is called. Returns")
+			g.P("// ErrPendingDraftExists if any chain field already has a pending")
+			g.P("// DRAFTED row for this key.")
 			g.P("func (r *", modelName, "Repo) Upsert(ctx context.Context, model *", modelName, ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 			emitResolveActor()
@@ -1569,6 +1656,13 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// gorm.ErrRecordNotFound if the PII row doesn't exist (no upsert
 			// — use Upsert for that). Only the conflict-updatable columns
 			// are written; created_by stays intact.
+			g.P("// Update strictly UPDATEs the PII row (no insert-on-miss — use Upsert")
+			g.P("// for that) and stages DRAFTED chain entries for every chain-stored")
+			g.P("// field whose value differs from the latest committed value. Only the")
+			g.P("// mutable columns are touched; created_by and created_at stay intact.")
+			g.P("// Returns gorm.ErrRecordNotFound if the PII row does not exist, or")
+			g.P("// ErrPendingDraftExists if any chain field already has a pending")
+			g.P("// DRAFTED row for this key.")
 			g.P("func (r *", modelName, "Repo) Update(ctx context.Context, model *", modelName, ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 			emitResolveActor()
@@ -1596,6 +1690,13 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// a partial unique index; violations surface as
 			// ErrPendingDraftExists. For chain-only messages this is the
 			// only ingestion path.
+			g.P("// DraftChain stages chain edits without touching the PII row. For every")
+			g.P("// chain-stored field whose value differs from the latest CREATED entry,")
+			g.P("// a new row is appended with Status='DRAFTED'. At most one DRAFTED row")
+			g.P("// per (key, field_name) is allowed (enforced by a partial unique")
+			g.P("// index); a second draft surfaces ErrPendingDraftExists. For chain-only")
+			g.P("// messages this is the primary ingestion path; for PII-backed messages")
+			g.P("// it lets callers stage chain edits separately from PII writes.")
 			g.P("func (r *", modelName, "Repo) DraftChain(ctx context.Context, model *", modelName, ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 			emitResolveActor()
@@ -1611,6 +1712,12 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// supplied tx_hash on the promoted rows (pass "" if not
 			// applicable). The state-machine trigger guards the transition.
 			// Idempotent — no-op when no DRAFTED rows exist for the key.
+			g.P("// CommitChain promotes every DRAFTED row for this key to CREATED in a")
+			g.P("// single atomic UPDATE and stamps the supplied txHash on the promoted")
+			g.P("// rows (pass \"\" if not applicable). The state-machine BEFORE UPDATE")
+			g.P("// trigger guards the DRAFTED → CREATED transition. Idempotent: a no-op")
+			g.P("// when no DRAFTED rows exist for the key. After commit, the rows are")
+			g.P("// visible from the committed view.")
 			g.P("func (r *", modelName, "Repo) CommitChain(ctx context.Context, ",
 				strings.Join(chainKeyParams, ", "), ", txHash string) error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
@@ -1628,6 +1735,11 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// Promotes every DRAFTED row for this key to DROPPED in a single
 			// UPDATE. Idempotent — no-op when no DRAFTED rows exist for the
 			// key. Use to discard a pending edit without committing it.
+			g.P("// DropChain promotes every DRAFTED row for this key to DROPPED in a")
+			g.P("// single UPDATE — discards a pending edit without committing. The")
+			g.P("// dropped rows remain in the chain table as audit history; they are")
+			g.P("// not visible from either view. Idempotent: no-op when no DRAFTED rows")
+			g.P("// exist for the key.")
 			g.P("func (r *", modelName, "Repo) DropChain(ctx context.Context, ",
 				strings.Join(chainKeyParams, ", "), ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
@@ -1674,6 +1786,14 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			colName := string(keyField.Desc.Name())
 
 			// Fetch queries the view by the chain key column (materialized as keys.key AS ptt_id).
+			g.P("// Fetch reads the view row keyed by the chain identifier column. Returns")
+			g.P("// gorm.ErrRecordNotFound if no row matches.")
+			if opts.ChainDrafts {
+				g.P("//")
+				g.P("// drafted=true reads from the ", strings.ToLower(modelName), "s_with_drafts overlay view,")
+				g.P("// surfacing uncommitted DRAFTED values; drafted=false reads from the")
+				g.P("// committed view. HasPendingDrafts is populated either way.")
+			}
 			g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ", paramName, " ", paramType, draftedSig, ") (*", modelName, "View, error) {")
 			g.P("  var view ", modelName, "View")
 			emitDraftedTableSetup()
@@ -1691,6 +1811,13 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			existsStatusFilter := ""
 			if opts.ChainDrafts {
 				existsStatusFilter = " AND status = ?"
+			}
+			if opts.ChainDrafts {
+				g.P("// Exists reports whether any committed (CREATED) chain row exists for the")
+				g.P("// given key. Not draft-aware — a key whose chain rows are still entirely")
+				g.P("// DRAFTED returns false (the record is not yet committed).")
+			} else {
+				g.P("// Exists reports whether any chain row exists for the given key.")
 			}
 			g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ", paramName, " ", paramType, ") (bool, error) {")
 			g.P("  var count int64")
@@ -1712,6 +1839,11 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 					continue
 				}
 				fp := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+				g.P("// FetchBy", field.GoName, " reads the view row by the unique ", field.Desc.Name(), " column.")
+				g.P("// Returns gorm.ErrRecordNotFound if no row matches.")
+				if draftedSig != "" {
+					g.P("// Same drafted-bool semantics as Fetch (overlay vs committed view).")
+				}
 				g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
 					"(ctx context.Context, ", fp, " ", goTypeForField(field), draftedSig, ") (*", modelName, "View, error) {")
 				g.P("  var view ", modelName, "View")
@@ -1748,6 +1880,15 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 				whereArgs[i] = paramName
 			}
 
+			g.P("// Fetch reads the view row keyed by the primary key, scoped to")
+			g.P("// non-soft-deleted records (deleted_at IS NULL). Returns")
+			g.P("// gorm.ErrRecordNotFound if no row matches.")
+			if draftedSig != "" {
+				g.P("//")
+				g.P("// drafted=true reads from the ", strings.ToLower(modelName), "s_with_drafts overlay view")
+				g.P("// (uncommitted DRAFTED values visible); drafted=false reads from the")
+				g.P("// committed view. HasPendingDrafts on the result is populated either way.")
+			}
 			g.P("func (r *", modelName, "Repo) Fetch(ctx context.Context, ",
 				strings.Join(fetchParams, ", "), draftedSig, ") (*", modelName, "View, error) {")
 			g.P("  var view ", modelName, "View")
@@ -1766,6 +1907,12 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 					continue
 				}
 				paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+				g.P("// FetchBy", field.GoName, " reads the view row by the unique ", field.Desc.Name(), " column,")
+				g.P("// scoped to non-soft-deleted records. Returns gorm.ErrRecordNotFound if no")
+				g.P("// row matches.")
+				if draftedSig != "" {
+					g.P("// Same drafted-bool semantics as Fetch (overlay vs committed view).")
+				}
 				g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
 					"(ctx context.Context, ", paramName, " ", goTypeForField(field), draftedSig, ") (*", modelName, "View, error) {")
 				g.P("  var view ", modelName, "View")
@@ -1781,6 +1928,12 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			if len(pkFields) > 1 {
 				for _, field := range pkFields {
 					paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+					g.P("// FetchBy", field.GoName, " returns every view row whose ", field.Desc.Name(), " equals the")
+					g.P("// given value — for composite primary keys, this is one PK component and")
+					g.P("// can match multiple rows. Scoped to non-soft-deleted records.")
+					if draftedSig != "" {
+						g.P("// Same drafted-bool semantics as Fetch (overlay vs committed view).")
+					}
 					g.P("func (r *", modelName, "Repo) FetchBy", field.GoName,
 						"(ctx context.Context, ", paramName, " ", goTypeForField(field), draftedSig, ") ([]", modelName, "View, error) {")
 					g.P("  var views []", modelName, "View")
@@ -1794,6 +1947,8 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 				}
 			}
 
+			g.P("// Exists reports whether a non-soft-deleted PII row exists for the given")
+			g.P("// primary key. Not draft-aware — answered by committed PII state.")
 			g.P("func (r *", modelName, "Repo) Exists(ctx context.Context, ",
 				strings.Join(fetchParams, ", "), ") (bool, error) {")
 			g.P("  var count int64")
@@ -1811,6 +1966,8 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 					continue
 				}
 				paramName := strings.ToLower(field.GoName[:1]) + field.GoName[1:]
+				g.P("// ExistsBy", field.GoName, " reports whether a non-soft-deleted PII row exists for")
+				g.P("// the given ", field.Desc.Name(), " value.")
 				g.P("func (r *", modelName, "Repo) ExistsBy", field.GoName,
 					"(ctx context.Context, ", paramName, " ", goTypeForField(field), ") (bool, error) {")
 				g.P("  var count int64")
@@ -1845,6 +2002,13 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 					refIDExpr = fmt.Sprintf("fmt.Sprintf(\"%s\", %s)",
 						strings.Join(fmtParts, ":"), strings.Join(whereArgs, ", "))
 				}
+				g.P("// AuditLog returns the audit_pii_", strings.ToLower(modelName), "s history for a single")
+				g.P("// record, chronologically (oldest first). Each row is a snapshot of the")
+				g.P("// PII row taken immediately BEFORE an UPDATE or DELETE by the AFTER")
+				g.P("// trigger; INSERTs do not produce audit rows, so a record that was")
+				g.P("// inserted but never modified returns the empty slice. Param signature")
+				g.P("// mirrors Fetch — takes the PK; for composite PKs the audit ref_id is")
+				g.P("// the PK components joined with ':'.")
 				g.P("func (r *", modelName, "Repo) AuditLog(ctx context.Context, ",
 					strings.Join(fetchParams, ", "), ") ([]", modelName, "PiiAudit, error) {")
 				g.P("  var rows []", modelName, "PiiAudit")
@@ -1891,6 +2055,14 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 					strings.Join(fmtParts, ":"), strings.Join(chArgs, ", "))
 			}
 
+			g.P("// ChangeLog returns the full per-field version history for a single record,")
+			g.P("// grouped by field_name then version (1-based, ascending). With")
+			g.P("// chain-drafts enabled the result includes rows of every status (DRAFTED")
+			g.P("// / CREATED / DROPPED) — filter by status on the returned entries if")
+			g.P("// only committed history is wanted. Soft-deleted PII rows do NOT mask")
+			g.P("// chain history (chain entries persist independently). Returns")
+			g.P("// gorm.ErrRecordNotFound when no chain rows exist for the key. Param")
+			g.P("// signature mirrors Create — takes the chain identifier key field(s).")
 			g.P("func (r *", modelName, "Repo) ChangeLog(ctx context.Context, ",
 				strings.Join(chParams, ", "), ") (ChangeLog, error) {")
 			g.P("  var rows []", modelName, "Chain")
