@@ -29,7 +29,7 @@ import (
 //   - two views are emitted (committed-only and with-drafts)
 //   - the repo emits DraftChain / CommitChain / DropChain methods plus
 //     Upsert / Update (and SaveAll / SaveChain are NOT emitted)
-//   - Save (PII strict INSERT) chains into DraftChain after the PII write
+//   - Create (PII strict INSERT) chains into DraftChain after the PII write
 //   - Fetch / FetchBy* signatures gain a trailing `drafted bool` parameter
 //   - the View struct gains a HasPendingDrafts bool field
 type Options struct {
@@ -153,7 +153,7 @@ func GenerateHelpers(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	g.P("}")
 	if opts.ChainDrafts {
 		g.P()
-		g.P("// ErrPendingDraftExists is returned by Save / Upsert / Update /")
+		g.P("// ErrPendingDraftExists is returned by Create / Upsert / Update /")
 		g.P("// DraftChain when a record already has a DRAFTED chain row for one")
 		g.P("// of the fields being staged. The caller's recourse is to commit")
 		g.P("// the existing draft (CommitChain) or drop it (DropChain) before")
@@ -1475,7 +1475,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 				strings.Join(fmtParts, ":"), strings.Join(chainKeyArgs, ", "))
 		}
 		if !chainOnly {
-			// ── Save (PII-backed only) ────────────────────────────────────
+			// ── Create (PII-backed only) ──────────────────────────────────
 			// Strict INSERT of the PII row; errors with the driver-native
 			// error on PK / unique conflict.
 			//
@@ -1486,7 +1486,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			// visible from the committed view; callers must CommitChain to
 			// promote them. ErrPendingDraftExists surfaces if any chain
 			// field already has a pending DRAFTED row for this key.
-			g.P("func (r *", modelName, "Repo) Save(ctx context.Context, model *", modelName, ") error {")
+			g.P("func (r *", modelName, "Repo) Create(ctx context.Context, model *", modelName, ") error {")
 			g.P("  return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {")
 			emitResolveActor()
 			emitInstallActorSessionVar()
@@ -1867,9 +1867,10 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 		// remain queryable. Returns gorm.ErrRecordNotFound if the key has no
 		// chain rows at all.
 		//
-		// Param signature mirrors Save's compositeKey construction: takes the
-		// chain identifier key field(s) and composes the lookup key the same
-		// way Save does, so callers hand it whatever they originally Saved.
+		// Param signature mirrors Create's compositeKey construction: takes
+		// the chain identifier key field(s) and composes the lookup key the
+		// same way Create does, so callers hand it whatever they originally
+		// wrote.
 		{
 			chParams := make([]string, len(keyFields))
 			chArgs := make([]string, len(keyFields))
@@ -2028,7 +2029,7 @@ func jsonVarName(field *protogen.Field) string {
 // proto model fields, and repo parameters — all of which want the typed enum.
 func goTypeForField(field *protogen.Field) string {
 	// google.protobuf.Timestamp → time.Time (not *Timestamppb).
-	// Conversions happen at the model boundary via .AsTime() in Save.
+	// Conversions happen at the model boundary via .AsTime() in Create.
 	if isProtoTimestamp(field) {
 		return "time.Time"
 	}
@@ -2356,8 +2357,8 @@ func isSdmRecord(msg *protogen.Message) bool {
 
 // isChainOnly reports whether a message has no PII-routed fields (no primary_key,
 // no pii-annotated fields). For chain-only messages the generator skips the PII
-// table, SavePii, and FK constraints, and emits a pivot view over chain_* instead
-// of a join-based view anchored on pii_*.
+// table, the Create method, and FK constraints, and emits a pivot view over
+// chain_* instead of a join-based view anchored on pii_*.
 func isChainOnly(msg *protogen.Message) bool {
 	for _, field := range msg.Fields {
 		opts := getFieldOptions(field)

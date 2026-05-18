@@ -164,7 +164,7 @@ sdm: "%s"
 # Opt-in chain draft/commit workflow. When true: chain rows carry a status
 # (DRAFTED / CREATED / DROPPED), the repo emits DraftChain / CommitChain /
 # DropChain plus Upsert / Update (SaveAll and SaveChain are NOT emitted),
-# Save chains into DraftChain after the PII write, Fetch / FetchBy* take an
+# Create chains into DraftChain after the PII write, Fetch / FetchBy* take an
 # additional 'drafted bool' parameter, and two views are emitted (committed
 # and with-drafts). Defaults to false.
 # chain-drafts: false
