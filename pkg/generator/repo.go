@@ -20,10 +20,15 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 
 	needSha256 := false
 	needHex := false
+	// sdm runtime is imported whenever a repo method that resolves the actor
+	// from ctx is emitted — that's every PII / chain mutation method, so any
+	// SDM record in the file pulls it in.
+	needSdmRuntime := false
 	for _, msg := range file.Messages {
 		if !isSdmRecord(msg) {
 			continue
 		}
+		needSdmRuntime = true
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			if opts.Hashed {
@@ -75,6 +80,9 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	if opts.ChainDrafts {
 		g.P(`	"github.com/jackc/pgx/v5/pgconn"`)
 	}
+	if needSdmRuntime {
+		g.P(`	"github.com/kapow-tech/sdm/pkg/sdm"`)
+	}
 	if needPq {
 		g.P(`	"github.com/lib/pq"`)
 	}
@@ -94,10 +102,10 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 		chainOnly := isChainOnly(msg)
 
 		// Repo struct. The actor identifier for audit attribution flows
-		// exclusively via ctx (see WithActor / actorFromContext); the repo
-		// stays a pure data-access layer with no per-call mutable state.
+		// exclusively via ctx (see sdm.CtxWithActor / sdm.ActorFromContext);
+		// the repo stays a pure data-access layer with no per-call mutable state.
 		g.P("// ", modelName, "Repo is the data-access handle for ", modelName, ". The actor")
-		g.P("// identifier used for audit attribution flows via ctx (see WithActor);")
+		g.P("// identifier used for audit attribution flows via ctx (see sdm.CtxWithActor);")
 		g.P("// the repo is stateless and safe for concurrent use by multiple goroutines.")
 		g.P("type ", modelName, "Repo struct {")
 		g.P("  db *gorm.DB")
@@ -367,7 +375,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 		// ctx) so downstream emit blocks (emitPiiStruct, emitChainEntries)
 		// can reference it unconditionally.
 		emitResolveActor := func() {
-			g.P("    _actor := actorFromContext(ctx)")
+			g.P("    _actor := sdm.ActorFromContext(ctx)")
 		}
 
 		// emitInstallActorSessionVar installs `_actor` into the `sdm.actor`

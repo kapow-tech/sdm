@@ -124,7 +124,7 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 		}
 		// Audit columns — always present on every PII table.
 		// DeletedAt uses gorm.DeletedAt so GORM's soft-delete scope applies automatically.
-		// CreatedBy captures the actor at INSERT (from WithActor(ctx, …))
+		// CreatedBy captures the actor at INSERT (from sdm.CtxWithActor(ctx, …))
 		// and is preserved across upserts. "Who last updated this row" is
 		// not stored here — read it from the latest audit_pii_<name>s row,
 		// which the AFTER UPDATE trigger writes from the same `sdm.actor`
@@ -139,7 +139,7 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 
 	// ── Chain Table Structure ─────────────────────────────────────────────────
 	// Chain rows are append-only, so the only actor column is CreatedBy
-	// (populated from WithActor(ctx, …) at insert time).
+	// (populated from sdm.CtxWithActor(ctx, …) at insert time).
 	// When chain-drafts is enabled, each row also carries a Status
 	// (DRAFTED / CREATED / DROPPED). New rows are written as DRAFTED by
 	// DraftChain and promoted to CREATED by CommitChain or DROPPED by
@@ -250,7 +250,7 @@ func generateMessageModels(g *protogen.GeneratedFile, msg *protogen.Message, gen
 		g.P("// each mutation. LastValue is the full PII row at the moment of capture")
 		g.P("// (JSONB). ChangeType is 'UPDATE' or 'DELETE'; INSERTs do not produce")
 		g.P("// audit rows. ChangedBy is the actor read from the `sdm.actor` Postgres")
-		g.P("// session variable installed by the repo (see WithActor); direct GORM")
+		g.P("// session variable installed by the repo (see sdm.CtxWithActor); direct GORM")
 		g.P("// writes that do not pass through the repo record '' there.")
 		g.P("type ", modelName, "PiiAudit struct {")
 		g.P("  Id         int64          `gorm:\"column:id;primaryKey;autoIncrement\"`")
