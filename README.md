@@ -24,7 +24,7 @@ A runnable end-to-end demo lives at
 | Annotation | Effect |
 |---|---|
 | `(sdm.primary_key) = true` | Column is the PII table primary key. |
-| `(sdm.auto_increment) = true` | Generates `BIGSERIAL` in SQL and `autoIncrement` GORM tag; assigned value is copied back to the model on Save. |
+| `(sdm.auto_increment) = true` | Generates `BIGSERIAL` in SQL and `autoIncrement` GORM tag; assigned value is copied back to the model on Create. |
 | `(sdm.chain_identifier_key) = true` | Field's value is used as the chain table key (defaults to the PK if absent). Lets you use an opaque `user_id` string while the PK stays a numeric `id`. |
 | `(sdm.pii) = true` | Column lives in `pii_{name}s` (sensitive, single row per record). |
 | `(sdm.query_index) = true` | Column lives in PII for indexed lookups (no `pii` flag needed). |
@@ -102,7 +102,7 @@ The actor lands in three sinks:
 
 Repos that aren't wrapped with `WithActor` (bare `context.Background()`)
 record `""` for all three. Direct GORM calls that bypass the generated
-Save methods (`db.Exec("UPDATE …")`, `db.Unscoped().Delete(...)`) still
+write methods (`db.Exec("UPDATE …")`, `db.Unscoped().Delete(...)`) still
 fire the audit trigger but record `""` because they don't set the
 session variable.
 
@@ -115,7 +115,7 @@ sequence — globally `1, 2, 3 …` per field, not a single sequence across the
 whole table. Chain history is append-only and never rewritten.
 
 **Skip-if-unchanged.** Every chain-writing method (`SaveAll(_, true)` in OFF
-mode; `DraftChain` / `Save` / `Upsert` / `Update` in ON mode) first reads
+mode; `DraftChain` / `Create` / `Upsert` / `Update` in ON mode) first reads
 the latest stored value per chain field for the key (one `SELECT DISTINCT
 ON (field_name)`), then appends a new version only when the byte-form
 differs. A re-save with identical data produces zero new chain rows;
@@ -171,15 +171,15 @@ Both views additionally expose `has_pending_drafts bool` — an `EXISTS` subquer
 | — | `DropChain(ctx, key)` — promote DRAFTED → DROPPED for that key |
 | `Fetch(ctx, pk)` | `Fetch(ctx, pk, drafted bool)` — `false` reads `<name>s`; `true` reads `<name>s_with_drafts` |
 
-`Save` (PII strict INSERT) is emitted in both modes; in ON mode it also chains into `DraftChain` after the PII INSERT, all in the same transaction. `Exists` / `ExistsBy*` / `ChangeLog` / `AuditLog` are unchanged.
+`Create` (PII strict INSERT) is emitted in both modes; in ON mode it also chains into `DraftChain` after the PII INSERT, all in the same transaction. `Exists` / `ExistsBy*` / `ChangeLog` / `AuditLog` are unchanged.
 
 **Workflow**:
 
 ```go
 ctx := invoice.WithActor(ctx, "alice@example.com")
 
-// 1. Save: PII committed; chain rows staged as DRAFTED.
-_ = repo.Save(ctx, &invoice.Invoice{
+// 1. Create: PII committed; chain rows staged as DRAFTED.
+_ = repo.Create(ctx, &invoice.Invoice{
     InvoiceId: "inv_1", SellerId: "u_1", BuyerId: "u_2",
     Amount: 10000, Tags: []string{"draft"},
 })
@@ -202,7 +202,7 @@ v, _ = repo.Fetch(ctx, "inv_1", false)
 fmt.Println(v.Amount, v.TxHash, v.HasPendingDrafts) // 10000 tx-abc-123 false
 ```
 
-**Sentinel error**. `DraftChain` (and by extension `Save` / `Upsert` /
+**Sentinel error**. `DraftChain` (and by extension `Create` / `Upsert` /
 `Update` when chain-drafts is ON) returns `ErrPendingDraftExists` if any
 chain field of the record already has a pending DRAFTED row. The caller's
 recourse is to commit (`CommitChain`) or drop (`DropChain`) the existing
@@ -217,7 +217,7 @@ if err := repo.Upsert(ctx, inv); err != nil {
 }
 ```
 
-**Known caveat — half-state visibility.** Because `Save` / `Upsert` /
+**Known caveat — half-state visibility.** Because `Create` / `Upsert` /
 `Update` commit the PII row immediately but stage chain rows as DRAFTED,
 the committed view will show the PII columns updated and the chain
 columns NULL (or stale) until `CommitChain` runs. `HasPendingDrafts`
@@ -495,9 +495,9 @@ inv := &invoice.Invoice{
 }
 _ = repo.SaveAll(ctx, inv, true)
 
-// Save is a strict INSERT on the PII row — errors on PK / unique conflict.
+// Create is a strict INSERT on the PII row — errors on PK / unique conflict.
 // Use it when you want the conflict to surface as an error rather than an upsert.
-err := repo.Save(ctx, &invoice.Invoice{InvoiceId: "inv_001", /* … */})
+err := repo.Create(ctx, &invoice.Invoice{InvoiceId: "inv_001", /* … */})
 // err is a Postgres unique-violation since inv_001 already exists.
 _ = err
 
@@ -614,7 +614,7 @@ ON mode.
 
 | Method | Notes |
 |---|---|
-| `Save(ctx, *T)` | **Strict INSERT** of the PII row. Returns the driver-native error on PK / unique conflict. In OFF mode does not touch the chain table; in ON mode also calls `DraftChain` in the same transaction (chain rows staged as DRAFTED). Honors `WithActor` (writes `pii.created_by`). |
+| `Create(ctx, *T)` | **Strict INSERT** of the PII row. Returns the driver-native error on PK / unique conflict. In OFF mode does not touch the chain table; in ON mode also calls `DraftChain` in the same transaction (chain rows staged as DRAFTED). Honors `WithActor` (writes `pii.created_by`). |
 | `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the `deleted_at IS NULL` filter. Not draft-aware — existence is answered by committed state. |
 | `ChangeLog(ctx, key)` | Returns the full per-field version history as `map[field_name]map[version]{Value, Timestamp}`. Returns `gorm.ErrRecordNotFound` if no chain rows exist. |
 | `AuditLog(ctx, pk)` *(audit-on only)* | Returns `[]{Name}PiiAudit` rows for one PII record, oldest first. Each row carries `LastValue` (OLD as JSONB), `ChangeType` (`'UPDATE'`/`'DELETE'`), `ChangedBy` (from the `WithActor` ctx), and `ChangedAt`. Not emitted when `create-audit-tables: false`. |
