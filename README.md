@@ -104,7 +104,7 @@ two) views**:
 ```
 
 Application code talks to a **generated repository** that wraps GORM and
-threads a ctx-carried actor (`WithActor`) into all three sinks
+threads a ctx-carried actor (`sdm.CtxWithActor`) into all three sinks
 (`pii.created_by`, `chain.created_by`, `audit.changed_by`).
 
 ```
@@ -112,7 +112,7 @@ threads a ctx-carried actor (`WithActor`) into all three sinks
                        │
                        ▼
               ┌─────────────────┐
-              │   <Name>Repo    │   ◄── WithActor(ctx, "alice")
+              │   <Name>Repo    │   ◄── sdm.CtxWithActor(ctx, "alice")
               └────────┬────────┘
                        │ Create / Upsert / Update / SaveAll
        ┌───────────────┼─────────────────────┐
@@ -233,14 +233,20 @@ and removes the row; chain history persists either way.
 
 ### Actor attribution
 
-Pass the actor identifier on ctx with `{pkg}.WithActor(ctx, actorID)`
-once at a request boundary (HTTP/gRPC middleware, batch job startup, CLI
-entrypoint). All downstream `Save` / `SaveAll` / `SaveChain` calls
-inherit it:
+Pass the actor identifier on ctx with `sdm.CtxWithActor(ctx, actorID)`
+(from `github.com/kapow-tech/sdm/pkg/sdm`) once at a request boundary
+(HTTP/gRPC middleware, batch job startup, CLI entrypoint). All downstream
+`Create` / `Upsert` / `Update` / `SaveAll` / `Draft*` / `Commit*` calls
+inherit it — and crucially, the helper lives in a single shared package
+so one context propagates across **every** generated repo, not just the
+one whose package emitted it:
 
 ```go
-ctx := user.WithActor(ctx, "alice@example.com")
-repo.SaveAll(ctx, u, true)
+import "github.com/kapow-tech/sdm/pkg/sdm"
+
+ctx := sdm.CtxWithActor(ctx, "alice@example.com")
+userRepo.Create(ctx, u)        // alice attributed
+invoiceRepo.Create(ctx, i)     // alice attributed — same ctx, different repo
 // → pii.created_by   = "alice@example.com"   (at INSERT only)
 // → chain.created_by = "alice@example.com"   (every appended chain row)
 // → audit.changed_by = "alice@example.com"   (every UPDATE / DELETE)
@@ -254,7 +260,7 @@ The actor lands in three sinks:
 | `chain_{name}s.created_by` | Every new chain row | Append-only — each version records who appended it. |
 | `audit_pii_{name}s.changed_by` | Every UPDATE / DELETE | Written by the AFTER trigger from the `sdm.actor` Postgres session variable. |
 
-Repos that aren't wrapped with `WithActor` (bare `context.Background()`)
+Repos that aren't wrapped with `sdm.CtxWithActor` (bare `context.Background()`)
 record `""` for all three. Direct GORM calls that bypass the generated
 write methods (`db.Exec("UPDATE …")`, `db.Unscoped().Delete(...)`) still
 fire the audit trigger but record `""` because they don't set the
@@ -363,7 +369,7 @@ Both views additionally expose `has_pending_drafts bool` — an `EXISTS` subquer
 **Workflow**:
 
 ```go
-ctx := invoice.WithActor(ctx, "alice@example.com")
+ctx := sdm.CtxWithActor(ctx, "alice@example.com")
 
 // 1. Create: PII committed; chain rows staged as DRAFTED.
 _ = repo.Create(ctx, &invoice.Invoice{
@@ -650,10 +656,14 @@ Per proto, four files are emitted:
 - `{name}_sdm_repo.go` — GORM repository
 
 A single `sdm_helpers.go` per package holds `pgArrayLiteral` (for repeated
-scalar fields), the `ChangeLog` / `ChangeLogEntry` types, the
-`WithActor` / `actorFromContext` ctx helpers, `ErrPendingDraftExists` (when
-`chain-drafts: true`), and — when nested messages are present — the
-`protojson` / `protojsonArray` GORM serializers.
+scalar fields), the `ChangeLog` / `ChangeLogEntry` types,
+`ErrPendingDraftExists` (when `chain-drafts: true`), and — when nested
+messages are present — the `protojson` / `protojsonArray` GORM serializers.
+
+The actor-context helpers (`sdm.CtxWithActor` / `sdm.ActorFromContext`)
+live in the shared package `github.com/kapow-tech/sdm/pkg/sdm` so a ctx
+created by one helper propagates across every generated repo (not just
+the package it was created in).
 
 ### 3. Use in Go
 
@@ -663,6 +673,7 @@ default). For the draft/commit workflow, see [Chain drafts](#chain-drafts-opt-in
 ```go
 import (
     "context"
+    "github.com/kapow-tech/sdm/pkg/sdm"
     "gorm.io/driver/postgres"
     "gorm.io/gorm"
     "demo/models/invoice"
@@ -672,8 +683,9 @@ import (
 db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 
 // Attribute every downstream write to a single actor. Set once at a
-// request / job boundary; all repo calls on this ctx inherit it.
-ctx := user.WithActor(context.Background(), "alice@example.com")
+// request / job boundary; all repo calls on this ctx inherit it
+// (regardless of which repo's package they belong to).
+ctx := sdm.CtxWithActor(context.Background(), "alice@example.com")
 
 userRepo := user.NewUserRepo(db)
 // SaveAll(_, true) upserts PII + appends a chain version per changed field.
@@ -769,7 +781,12 @@ One package-level file is also emitted (once per Go package, not per proto file)
 
 | File | Purpose |
 |---|---|
-| `sdm_helpers.go` | `WithActor` / `actorFromContext`, `pgArrayLiteral`, `ChangeLog` / `ChangeLogEntry` types, `ErrPendingDraftExists` (chain-drafts ON), `protojson` / `protojsonArray` serializers. |
+| `sdm_helpers.go` | `pgArrayLiteral`, `ChangeLog` / `ChangeLogEntry` types, `ErrPendingDraftExists` (chain-drafts ON), `protojson` / `protojsonArray` serializers. |
+
+The actor-context helpers (`sdm.CtxWithActor` / `sdm.ActorFromContext`) are
+**not** emitted per package — they live in the shared runtime package
+`github.com/kapow-tech/sdm/pkg/sdm` so a ctx works across every generated
+repo, regardless of which package the repo was generated into.
 
 **Generated schema layout** (one-line reference):
 
@@ -820,16 +837,16 @@ ON mode.
 
 | Method | Notes |
 |---|---|
-| `Create(ctx, *T)` | **Strict INSERT** of the PII row. Returns the driver-native error on PK / unique conflict. In OFF mode does not touch the chain table; in ON mode also calls `DraftChain` in the same transaction (chain rows staged as DRAFTED). Honors `WithActor` (writes `pii.created_by`). |
+| `Create(ctx, *T)` | **Strict INSERT** of the PII row. Returns the driver-native error on PK / unique conflict. In OFF mode does not touch the chain table; in ON mode also calls `DraftChain` in the same transaction (chain rows staged as DRAFTED). Honors `sdm.CtxWithActor` (writes `pii.created_by`). |
 | `Exists(ctx, pk)` / `ExistsBy{Unique}` | Counts on the PII table with the `deleted_at IS NULL` filter. Not draft-aware — existence is answered by committed state. |
 | `ChangeLog(ctx, key)` | Returns the full per-field version history as `map[field_name]map[version]{Value, Timestamp}`. Returns `gorm.ErrRecordNotFound` if no chain rows exist. |
-| `AuditLog(ctx, pk)` *(audit-on only)* | Returns `[]{Name}PiiAudit` rows for one PII record, oldest first. Each row carries `LastValue` (OLD as JSONB), `ChangeType` (`'UPDATE'`/`'DELETE'`), `ChangedBy` (from the `WithActor` ctx), and `ChangedAt`. Not emitted when `create-audit-tables: false`. |
+| `AuditLog(ctx, pk)` *(audit-on only)* | Returns `[]{Name}PiiAudit` rows for one PII record, oldest first. Each row carries `LastValue` (OLD as JSONB), `ChangeType` (`'UPDATE'`/`'DELETE'`), `ChangedBy` (from the `sdm.CtxWithActor` ctx), and `ChangedAt`. Not emitted when `create-audit-tables: false`. |
 
 ### OFF mode (`chain-drafts: false`, default)
 
 | Method | Notes |
 |---|---|
-| `SaveAll(ctx, *T, withChain bool)` | Upserts the PII row (`ON CONFLICT … DO UPDATE` on the chain identifier key); when `withChain=true`, also appends new chain versions for every field whose value changed (skip-if-unchanged). Honors `WithActor`. |
+| `SaveAll(ctx, *T, withChain bool)` | Upserts the PII row (`ON CONFLICT … DO UPDATE` on the chain identifier key); when `withChain=true`, also appends new chain versions for every field whose value changed (skip-if-unchanged). Honors `sdm.CtxWithActor`. |
 | `Fetch(ctx, pk)` | Reads `*TView` from the view, filtered by `deleted_at IS NULL`. |
 | `FetchBy{Unique}(ctx, val)` | Generated for every `(sdm.unique)` field. |
 
@@ -837,9 +854,9 @@ ON mode.
 
 | Method | Notes |
 |---|---|
-| `Upsert(ctx, *T)` | PII upsert + `DraftChain` (chain rows staged as DRAFTED). Honors `WithActor`. |
-| `Update(ctx, *T)` | Strict PII UPDATE — returns `gorm.ErrRecordNotFound` when the row doesn't exist (no insert). Followed by `DraftChain`. Honors `WithActor`. |
-| `DraftChain(ctx, *T)` | Standalone draft entry — appends DRAFTED chain rows for fields differing from the latest CREATED. Returns `ErrPendingDraftExists` if a draft is already pending for any field of this record (resolve via `CommitChain` or `DropChain` first). Honors `WithActor` (writes `chain.created_by`). |
+| `Upsert(ctx, *T)` | PII upsert + `DraftChain` (chain rows staged as DRAFTED). Honors `sdm.CtxWithActor`. |
+| `Update(ctx, *T)` | Strict PII UPDATE — returns `gorm.ErrRecordNotFound` when the row doesn't exist (no insert). Followed by `DraftChain`. Honors `sdm.CtxWithActor`. |
+| `DraftChain(ctx, *T)` | Standalone draft entry — appends DRAFTED chain rows for fields differing from the latest CREATED. Returns `ErrPendingDraftExists` if a draft is already pending for any field of this record (resolve via `CommitChain` or `DropChain` first). Honors `sdm.CtxWithActor` (writes `chain.created_by`). |
 | `CommitChain(ctx, key…, txHash string)` | Promotes every DRAFTED row for this key to CREATED in a single UPDATE, stamping `txHash` on the promoted rows (pass `""` if not applicable). Idempotent — no-op when no drafts exist. Trigger-enforced transition. |
 | `DropChain(ctx, key…)` | Promotes every DRAFTED row for this key to DROPPED in a single UPDATE. Idempotent. |
 | `Fetch(ctx, pk, drafted bool)` | `drafted=false` reads the committed view `<name>s`; `drafted=true` reads the overlay view `<name>s_with_drafts`. Both filtered by `deleted_at IS NULL`. View struct's `HasPendingDrafts` is populated regardless of which is queried. |
@@ -869,7 +886,7 @@ yourself.
   + `{Name}PiiAudit` struct + `Repo.AuditLog`.
 - Existing PII rows are unaffected. The trigger only fires from this point
   forward; historical mutations are not back-filled.
-- Application code needs no change — `WithActor(ctx, …)` was already
+- Application code needs no change — `sdm.CtxWithActor(ctx, …)` was already
   populating `pii.created_by` / `chain.created_by`; turning on audit just
   adds `audit.changed_by` to the mix.
 
@@ -1089,7 +1106,7 @@ var snap map[string]any
 json.Unmarshal(rows[0].LastValue, &snap)
 require.Equal(t, "alice@example.com", snap["email"])  // OLD row's value
 require.Equal(t, "UPDATE", rows[0].ChangeType)
-require.Equal(t, "bob", rows[0].ChangedBy)            // from WithActor in the second SaveAll
+require.Equal(t, "bob", rows[0].ChangedBy)            // from sdm.CtxWithActor in the second SaveAll
 ```
 
 ## Operational notes
@@ -1225,6 +1242,8 @@ sdm/
 │   └── protoc-gen-sdm/      # protoc plugin entry point
 ├── pkg/
 │   ├── config/              # sdm.cfg.yaml load / write
+│   ├── sdm/                 # shared runtime — CtxWithActor / ActorFromContext
+│   │                        #   (imported by every generated repo)
 │   └── generator/           # code generator (split by artifact)
 │       ├── generator.go     # entry points + Options
 │       ├── helpers.go       # sdm_helpers.go emission
