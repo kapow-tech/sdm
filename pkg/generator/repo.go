@@ -479,11 +479,14 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			emitResolveActor()
 			if !chainOnly {
 				updatableCols := updatableSqlCols(msg)
-				conflictCol := string(keyFields[0].Desc.Name())
+				conflictCols := make([]string, len(keyFields))
+				for i, f := range keyFields {
+					conflictCols[i] = "{Name: \"" + string(f.Desc.Name()) + "\"}"
+				}
 				emitInstallActorSessionVar()
 				emitPiiStruct()
 				g.P("    if err := tx.Clauses(clause.OnConflict{")
-				g.P("      Columns:   []clause.Column{{Name: \"", conflictCol, "\"}},")
+				g.P("      Columns:   []clause.Column{", strings.Join(conflictCols, ", "), "},")
 				g.P("      DoUpdates: clause.AssignmentColumns([]string{\"", strings.Join(updatableCols, "\", \""), "\"}),")
 				g.P("    }).Create(&pii).Error; err != nil { return err }")
 				emitAutoIncrementCopyback()
@@ -500,7 +503,10 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 
 		if opts.ChainDrafts && !chainOnly {
 			updatableCols := updatableSqlCols(msg)
-			conflictCol := string(keyFields[0].Desc.Name())
+			conflictCols := make([]string, len(keyFields))
+			for i, f := range keyFields {
+				conflictCols[i] = "{Name: \"" + string(f.Desc.Name()) + "\"}"
+			}
 
 			// ── Upsert (ON mode, PII-backed only) ─────────────────────────
 			// PII upsert (INSERT, or on conflict UPDATE the mutable columns)
@@ -520,7 +526,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			emitInstallActorSessionVar()
 			emitPiiStruct()
 			g.P("    if err := tx.Clauses(clause.OnConflict{")
-			g.P("      Columns:   []clause.Column{{Name: \"", conflictCol, "\"}},")
+			g.P("      Columns:   []clause.Column{", strings.Join(conflictCols, ", "), "},")
 			g.P("      DoUpdates: clause.AssignmentColumns([]string{\"", strings.Join(updatableCols, "\", \""), "\"}),")
 			g.P("    }).Create(&pii).Error; err != nil { return err }")
 			emitAutoIncrementCopyback()
@@ -548,8 +554,14 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			emitResolveActor()
 			emitInstallActorSessionVar()
 			emitPiiStruct()
+			updateWhereCols := make([]string, len(keyFields))
+			updateWhereArgs := make([]string, len(keyFields))
+			for i, f := range keyFields {
+				updateWhereCols[i] = string(f.Desc.Name()) + " = ?"
+				updateWhereArgs[i] = "model." + f.GoName
+			}
 			g.P("    _result := tx.Model(&", modelName, "Pii{}).")
-			g.P("      Where(\"", conflictCol, " = ?\", model.", keyFields[0].GoName, ").")
+			g.P("      Where(\"", strings.Join(updateWhereCols, " AND "), "\", ", strings.Join(updateWhereArgs, ", "), ").")
 			g.P("      Select([]string{\"", strings.Join(updatableCols, "\", \""), "\"}).")
 			g.P("      Updates(pii)")
 			g.P("    if _result.Error != nil { return _result.Error }")
@@ -970,6 +982,7 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 			g.P("    log[row.FieldName][row.Version] = ChangeLogEntry{")
 			g.P("      Value:     row.FieldValue,")
 			g.P("      Timestamp: row.CreatedAt,")
+			g.P("      Actor:     row.CreatedBy,")
 			g.P("    }")
 			g.P("  }")
 			g.P("  return log, nil")

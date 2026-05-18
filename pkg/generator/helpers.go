@@ -66,6 +66,7 @@ func GenerateHelpers(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	g.P("type ChangeLogEntry struct {")
 	g.P("  Value     string    `json:\"value\"`")
 	g.P("  Timestamp time.Time `json:\"timestamp\"`")
+	g.P("  Actor     string    `json:\"actor\"`")
 	g.P("}")
 	g.P()
 	g.P("// ChangeLog maps field_name → version → entry. Versions are 1-based and")
