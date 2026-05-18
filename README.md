@@ -1,21 +1,161 @@
 # Sensitive Data Management (SDM)
 
 SDM is a Go toolset for separating sensitive data (PII) from append-only chain
-data using Protobuf annotations. From a single annotated `.proto` file it
-generates:
+history using Protobuf annotations. From a single annotated `.proto` file it
+generates Go GORM structs, PostgreSQL DDL, a type-safe repository, and an
+optional audit trail — keeping the *what changed* (chain) physically separate
+from the *who-they-are* (PII) so each can be retained, encrypted, or purged
+independently.
 
-- Go GORM structs (`{Name}Pii`, `{Name}Chain`, `{Name}View`, optionally `{Name}PiiAudit`) plus a `View.AsBaseModel()` converter
-- PostgreSQL DDL (PII table, chain table, combined view, version trigger; optionally an audit table + AFTER UPDATE/DELETE trigger; optionally a state-machine trigger + partial unique index for chain drafts)
-- A type-safe repository whose surface depends on which optional features are enabled (see [Repository surface](#repository-surface-per-message))
-- A single ctx-based actor channel (`WithActor`) that populates `created_by` on PII / chain and `changed_by` on audit rows
+## Why SDM?
 
-Two config knobs gate optional behavior:
+Most line-of-business systems eventually grow three intertwined concerns:
 
-- `create-audit-tables` (default `true`) — emit per-PII audit tables, the AFTER UPDATE/DELETE trigger, the `{Name}PiiAudit` struct, and `Repo.AuditLog`. See [PII audit log](#pii-audit-log).
-- `chain-drafts` (default `false`) — opt-in draft/commit workflow on chain rows. Each chain row carries a status (DRAFTED / CREATED / DROPPED); the repo emits `DraftChain` / `CommitChain` / `DropChain` plus `Upsert` / `Update` (and SaveAll / SaveChain are NOT emitted); Fetch takes a `drafted bool` parameter. See [Chain drafts](#chain-drafts-opt-in).
+1. **PII** that needs to be queryable but should be isolated, encrypt-at-rest,
+   and erasable on request (GDPR / KYC retention rules).
+2. **Auditable history** of who-changed-what-when, separate from the live row
+   so deletes don't take the trail with them.
+3. **Append-only versioned data** (regulatory records, ledger entries,
+   compliance documents) that must survive even if the PII anchor is later
+   forgotten.
+
+The conventional shape — one wide table with `updated_at` and a sidecar audit
+log written by application code — couples all three onto a single row, hides
+schema invariants in business logic, and makes "drop this user's PII"
+non-trivial.
+
+SDM compiles those concerns into three first-class tables backed by triggers
+and a generated repository:
+
+- `pii_<name>s` — current PII (sensitive, single row per record, soft-deletable, erasable in place)
+- `chain_<name>s` — append-only per-field versioned history with a stable
+  `(key, field_name, version)` PK, independent of the PII row's lifetime
+- `audit_pii_<name>s` *(optional)* — DB-trigger-written `OLD`-row snapshots
+  capturing every UPDATE/DELETE on the PII table
+
+Plus a `<name>s` view that joins the three so reads stay a single SELECT.
+
+You write `.proto` annotations to describe **shape**; the generator handles
+table layout, triggers, repository methods, and serialization. Two config
+knobs (`create-audit-tables`, `chain-drafts`) opt in to additional behavior.
 
 A runnable end-to-end demo lives at
 [sdm-tool/sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
+
+## Table of contents
+
+- [How it fits together](#how-it-fits-together)
+- [Quick start](#quick-start)
+- [Features](#features)
+  - [Field annotations](#field-annotations-sdmprotosannotationsproto)
+  - [Type handling](#type-handling)
+  - [Baked-in audit + soft-delete](#baked-in-audit--soft-delete)
+  - [Actor attribution](#actor-attribution)
+  - [Chain versioning](#chain-versioning)
+  - [Chain drafts (opt-in)](#chain-drafts-opt-in)
+  - [Change log](#change-log)
+  - [PII audit log](#pii-audit-log)
+  - [View → base model](#view--base-model)
+- [Installation](#installation)
+- [Configuration (`sdm.cfg.yaml`)](#configuration-sdmcfgyaml)
+- [Usage](#usage)
+- [CLI reference](#cli-reference)
+- [Generated artifacts](#generated-artifacts)
+- [Repository surface (per message)](#repository-surface-per-message)
+- [Migration guide](#migration-guide)
+- [Recipes](#recipes)
+- [Testing patterns](#testing-patterns)
+- [Operational notes](#operational-notes)
+- [Limitations and roadmap](#limitations-and-roadmap)
+- [Using with buf directly](#using-with-buf-directly)
+- [Project layout](#project-layout)
+- [Contributing](#contributing)
+
+## How it fits together
+
+For each annotated message, the generator emits **three tables** and **one (or
+two) views**:
+
+```
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │                                                                      │
+   │  pii_<name>s                                                         │
+   │    └── one row per record. PII / FK / query-indexed columns,         │
+   │        plus audit cols (created_at, updated_at, deleted_at, created_by)
+   │        Soft-deletable via gorm.DeletedAt.                            │
+   │                                                                      │
+   │  chain_<name>s                                                       │
+   │    └── append-only history. PK (key, field_name, version).           │
+   │        Each chain-stored field gets its own row per change;          │
+   │        version bumps via a BEFORE INSERT trigger.                    │
+   │                                                                      │
+   │  audit_pii_<name>s     [optional: create-audit-tables: true]         │
+   │    └── per-mutation snapshot of OLD row + change_type + changed_by.  │
+   │        Written by an AFTER UPDATE/DELETE trigger on pii_<name>s.     │
+   │                                                                      │
+   │  <name>s     (view)                                                  │
+   │    └── joins pii + latest chain row per field. Single SELECT for     │
+   │        Fetch. Surfaces HasPendingDrafts when chain-drafts is on.     │
+   │                                                                      │
+   │  <name>s_with_drafts  (view, chain-drafts mode only)                 │
+   │    └── overlay view that surfaces DRAFTED chain values too.          │
+   │                                                                      │
+   └──────────────────────────────────────────────────────────────────────┘
+```
+
+Application code talks to a **generated repository** that wraps GORM and
+threads a ctx-carried actor (`WithActor`) into all three sinks
+(`pii.created_by`, `chain.created_by`, `audit.changed_by`).
+
+```
+                  Application
+                       │
+                       ▼
+              ┌─────────────────┐
+              │   <Name>Repo    │   ◄── WithActor(ctx, "alice")
+              └────────┬────────┘
+                       │ Create / Upsert / Update / SaveAll
+       ┌───────────────┼─────────────────────┐
+       ▼               ▼                     ▼
+   INSERT/UPSERT   APPEND CHAIN           SELECT FROM
+   pii_<name>s     chain_<name>s          <name>s (view)
+       │                                       ▲
+       │  AFTER UPDATE/DELETE  trigger         │
+       ▼                                       │
+   audit_pii_<name>s ◄── reads sdm.actor       │
+   (snapshot of OLD)     session variable      │
+                                               │
+                Fetch / FetchBy* / Exists ─────┘
+```
+
+**Two opt-in knobs** in `sdm.cfg.yaml` change the generated surface:
+
+| Knob | Default | Effect when **true** |
+|---|---|---|
+| `create-audit-tables` | `true` | Emits `audit_pii_<name>s`, the AFTER trigger, the `<Name>PiiAudit` struct, and `Repo.AuditLog`. See [PII audit log](#pii-audit-log). |
+| `chain-drafts` | `false` | Each chain row carries a `status` (DRAFTED / CREATED / DROPPED). Repo emits `DraftChain` / `CommitChain` / `DropChain` + `Upsert` / `Update` (SaveAll / SaveChain are not emitted). Fetch gains a `drafted bool` parameter. See [Chain drafts](#chain-drafts-opt-in). |
+
+## Quick start
+
+```bash
+# 1. Install the CLI
+go install github.com/kapow-tech/sdm/cmd/sdm@latest
+
+# 2. In your project: set up config + tooling
+sdm config       # writes sdm.cfg.yaml
+sdm setup        # installs protoc-gen-go, buf, protoc-gen-sdm; exports SDM protos
+
+# 3. Annotate your .proto (see "Field annotations" below)
+# 4. Generate
+sdm generate
+
+# 5. Use the generated repo
+go run .
+```
+
+A complete worked example — proto files, generator config, application code,
+SQL schema, and an integration test suite — lives at
+[sdm-example/demo](https://github.com/jinuthankachan/sdm-examples).
 
 ## Features
 
@@ -32,6 +172,17 @@ A runnable end-to-end demo lives at
 | `(sdm.unique) = true` | Emits a SQL `UNIQUE` constraint **and** generates `FetchBy{Field}` / `ExistsBy{Field}` methods. |
 | `(sdm.references) = "Type.field"` | Emits a foreign key. The referenced field must be `UNIQUE` or `PRIMARY KEY`. Reference fields are placed in the PII table. |
 | `(sdm.json) = true` | String field stored as Postgres `JSONB`; Go side uses `datatypes.JSON`. |
+
+**Where does each field land?**
+
+| Annotations present | PII column | Chain column | View column |
+|---|---|---|---|
+| `primary_key`, `pii`, `query_index`, `references` | ✅ | — | ✅ (from PII) |
+| neither of the above | — | ✅ (versioned) | ✅ (latest chain value) |
+| `hashed` | (PII column also) | ✅ extra `hashed_<field>` row of `sha256(value)` | ✅ extra `Hashed<Field>` column |
+| `auto_increment` on PK | ✅ as `BIGSERIAL` | — | ✅ |
+
+Fields with no annotation default to chain-stored.
 
 ### Type handling
 
@@ -77,6 +228,9 @@ The generated PII and View structs carry the timestamps as `time.Time` /
 `ExistsBy{X}` methods append an explicit `WHERE deleted_at IS NULL` filter
 so soft-deleted rows stay hidden.
 
+Hard-delete via `db.Unscoped().Delete(&xPii)` bypasses the soft-delete scope
+and removes the row; chain history persists either way.
+
 ### Actor attribution
 
 Pass the actor identifier on ctx with `{pkg}.WithActor(ctx, actorID)`
@@ -105,6 +259,14 @@ record `""` for all three. Direct GORM calls that bypass the generated
 write methods (`db.Exec("UPDATE …")`, `db.Unscoped().Delete(...)`) still
 fire the audit trigger but record `""` because they don't set the
 session variable.
+
+**How the audit trigger reads the actor.** Inside every generated write
+method's transaction, the repo runs `SELECT set_config('sdm.actor', $1,
+true)` (the `true` makes it `SET LOCAL` — transaction-scoped). The audit
+trigger then reads `current_setting('sdm.actor', true)` and writes that
+value to `audit.changed_by`. Because the session var is transaction-scoped,
+two concurrent requests with different actors can't cross-contaminate each
+other's audit rows.
 
 ### Chain versioning
 
@@ -152,6 +314,31 @@ CREATE UNIQUE INDEX chain_<name>s_one_draft
 -- BEFORE UPDATE trigger that allows DRAFTED→CREATED, DRAFTED→DROPPED, or
 -- "status unchanged"; everything else raises an exception.
 ```
+
+**State machine**:
+
+```
+                  DraftChain / Create / Upsert / Update
+                            │
+                            ▼
+                       ┌─────────┐
+                       │ DRAFTED │ ◄── at-most-one per (key, field_name)
+                       └────┬────┘
+              CommitChain   │   DropChain
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+        ┌─────────┐                 ┌─────────┐
+        │ CREATED │  (committed     │ DROPPED │  (discarded
+        └─────────┘   history)      └─────────┘   audit trail)
+              │                           │
+              ▼                           ▼
+       visible in committed         visible in NEITHER
+       view + overlay view          view (history only)
+```
+
+Other transitions raise `illegal chain status transition` (SQLSTATE 23514)
+via the trigger.
 
 **Two views** are emitted instead of one:
 
@@ -246,6 +433,10 @@ type ChangeLog map[string]map[int64]ChangeLogEntry // field_name → version →
 Soft-deleted PII rows do **not** mask chain history — chain entries persist
 independently. Returns `gorm.ErrRecordNotFound` when the key has no chain rows.
 
+In chain-drafts mode the returned `ChangeLog` includes rows of every status
+(DRAFTED / CREATED / DROPPED). Filter on `Value` semantics if you only want
+committed history.
+
 ### PII audit log
 
 When enabled (default), every PII table gets a sibling `audit_pii_{name}s`
@@ -311,7 +502,7 @@ integration suite uses this pattern — see
 
 Every `{Name}View` carries an `AsBaseModel()` method that returns a fresh
 `*{Name}` proto. Use it when you've fetched the view and want to mutate +
-re-`SaveAll` without manually mapping fields. The converter handles:
+re-save without manually mapping fields. The converter handles:
 
 - scalar fields — direct assignment
 - `enum` fields — `string` → typed enum via the proto-generated `{EnumType}_value` map lookup
@@ -337,6 +528,15 @@ Two more steps put the project on a clean footing:
 sdm config   # writes sdm.cfg.yaml in the current directory
 sdm setup    # installs protoc-gen-go, buf, protoc-gen-sdm; exports SDM protos
 ```
+
+For local development against an `sdm` checkout, build directly:
+
+```bash
+cd /path/to/sdm
+go install ./cmd/sdm ./cmd/protoc-gen-sdm
+```
+
+The Makefile target `make build` does the same.
 
 ## Configuration (`sdm.cfg.yaml`)
 
@@ -514,9 +714,6 @@ _ = repo.SaveAll(ctx, roundTrip, true) // chain v2 for amount; other fields unch
 // SaveAll(_, false): upsert PII only, leave chain alone.
 _ = repo.SaveAll(ctx, roundTrip, false)
 
-// SaveChain: append chain entries only (still skip-if-unchanged).
-_ = repo.SaveChain(ctx, roundTrip)
-
 // Full per-field version history.
 log, _ := repo.ChangeLog(ctx, "inv_001")
 // log["amount"][1].Value == "10000"
@@ -535,37 +732,46 @@ for _, r := range audit {
 }
 ```
 
-## CLI Reference
+## CLI reference
 
 | Command | Description |
 |---|---|
 | `sdm setup` | Installs `protoc-gen-go`, `buf`, `protoc-gen-sdm`; exports SDM annotation protos to a local directory. |
 | `sdm config` | Writes a default `sdm.cfg.yaml`. |
-| `sdm generate` | Compiles user protos and writes the four generated files per message. Flags: `--proto`, `--out`, `--cfg` (default `sdm.cfg.yaml`). |
+| `sdm generate` | Compiles user protos and writes the four generated files per message. |
+| `sdm --version` / `sdm -v` | Prints the CLI version (built into the binary at install time; `dev` for source builds). |
 
-## Using with buf directly
+`sdm generate` flags:
 
-```bash
-go install github.com/kapow-tech/sdm/cmd/protoc-gen-sdm@latest
-```
+| Flag | Default | Description |
+|---|---|---|
+| `--cfg` | `sdm.cfg.yaml` | Path to config file (relative paths resolve from the CWD). |
+| `--proto` | (config) | Override the input proto path. |
+| `--out` | (config) | Override the output directory for Go files. |
 
-```yaml
-# buf.gen.yaml
-version: v1
-plugins:
-  - plugin: go
-    out: .
-    opt: paths=source_relative
-  - plugin: sdm
-    out: .
-    opt: paths=source_relative
-```
+The `Options` struct (`create-audit-tables`, `chain-drafts`) is read from
+`sdm.cfg.yaml` only — there is no per-invocation flag for them on the
+`sdm generate` side, but `protoc-gen-sdm` accepts them via
+`--sdm_opt=key=value` when invoked through `buf` / `protoc`.
 
-```bash
-buf generate
-```
+## Generated artifacts
 
-## Generated schema layout
+Per recorded message (per `.proto` file), four Go/SQL files are emitted:
+
+| File | Purpose |
+|---|---|
+| `<name>.pb.go` | Standard `protoc-gen-go` output (proto message types). |
+| `<name>_sdm_model.go` | `{Name}Pii`, `{Name}Chain`, `{Name}View` GORM structs + `TableName()` overrides; `{Name}PiiAudit` (when audit on); `EnsureUnique` chain probe; `AsBaseModel` view-to-proto converter. |
+| `<name>_sdm_schema.sql` | DDL: `pii_<name>s`, `chain_<name>s` (+ chain-drafts status column / partial unique index / state-machine trigger when ON), `audit_pii_<name>s` (+ AFTER trigger when audit ON), version trigger, one or two views. |
+| `<name>_sdm_repo.go` | `{Name}Repo` with `NewXxxRepo` constructor + write methods (`Create` / `Upsert` / `Update` / `SaveAll` / `DraftChain` / `CommitChain` / `DropChain`) + read methods (`Fetch` / `FetchBy*` / `Exists` / `ExistsBy*` / `AuditLog` / `ChangeLog`). |
+
+One package-level file is also emitted (once per Go package, not per proto file):
+
+| File | Purpose |
+|---|---|
+| `sdm_helpers.go` | `WithActor` / `actorFromContext`, `pgArrayLiteral`, `ChangeLog` / `ChangeLogEntry` types, `ErrPendingDraftExists` (chain-drafts ON), `protojson` / `protojsonArray` serializers. |
+
+**Generated schema layout** (one-line reference):
 
 - **`pii_{name}s`** — primary key, PII / query-index / FK columns, plus the
   three timestamp audit columns (`created_at`, `updated_at`, `deleted_at`,
@@ -648,3 +854,420 @@ ON mode.
 | Method | Notes |
 |---|---|
 | `View.AsBaseModel() *T` | Converts the view row back to the base proto model (Timestamp → `timestamppb`, repeated message JSON → `[]*Message`, datatypes.JSON → string, pq.StringArray → []string). Audit columns and hashed sidecars are dropped. |
+| `Chain.EnsureUnique(tx) bool` | Probe used by callers that want to enforce global uniqueness of a chain value before staging or committing it. Returns false if the query errors. |
+
+## Migration guide
+
+The two config knobs can be flipped at any time; the generated code is
+self-contained, but **DB schema changes are not auto-migrated** — you need
+to apply the diff against `<name>_sdm_schema.sql` against your live database
+yourself.
+
+### Flipping `create-audit-tables: false → true`
+
+- New artifacts: `audit_pii_<name>s` table + `audit_pii_<name>s_log_trigger`
+  + `{Name}PiiAudit` struct + `Repo.AuditLog`.
+- Existing PII rows are unaffected. The trigger only fires from this point
+  forward; historical mutations are not back-filled.
+- Application code needs no change — `WithActor(ctx, …)` was already
+  populating `pii.created_by` / `chain.created_by`; turning on audit just
+  adds `audit.changed_by` to the mix.
+
+### Flipping `create-audit-tables: true → false`
+
+- The generator stops emitting the audit table, trigger, struct, and
+  `AuditLog` method.
+- The existing `audit_pii_<name>s` rows stay in the DB until you drop them
+  manually; the trigger function definition remains too (drop with
+  `DROP FUNCTION IF EXISTS audit_pii_<name>s_log();`). The repo simply
+  stops writing to / reading from it.
+- Application code that calls `repo.AuditLog(...)` will fail to compile.
+  Replace with calls to `repo.ChangeLog(...)` for per-field history (no
+  attribution column though) or migrate to a different sink.
+
+### Flipping `chain-drafts: false → true`
+
+This is the bigger jump: the repo surface changes (`SaveAll` /
+`SaveChain` are no longer emitted; `Upsert` / `Update` / `DraftChain` /
+`CommitChain` / `DropChain` appear instead) and the view signatures gain
+a `drafted bool` parameter.
+
+DDL diff:
+- Adds `status TEXT NOT NULL DEFAULT 'CREATED' CHECK …` column on each
+  `chain_<name>s` table.
+- Adds partial unique index `chain_<name>s_one_draft`.
+- Adds state-machine trigger `chain_<name>s_status_guard`.
+- Replaces single view `<name>s` with two views (`<name>s` + `<name>s_with_drafts`).
+
+To migrate live data:
+```sql
+ALTER TABLE chain_<name>s
+  ADD COLUMN status TEXT NOT NULL DEFAULT 'CREATED'
+    CHECK (status IN ('DRAFTED', 'CREATED', 'DROPPED'));
+-- index + trigger DDL: copy from the regenerated <name>_sdm_schema.sql
+-- views: DROP VIEW <name>s; then run the new CREATE VIEW statements
+```
+
+Application code changes:
+- `repo.SaveAll(ctx, m, true)` → `repo.Upsert(ctx, m); repo.CommitChain(ctx, key, txHash)`
+- `repo.SaveAll(ctx, m, false)` → `repo.Upsert(ctx, m)` (chain stays in DRAFTED until you commit or drop)
+- `repo.SaveChain(ctx, m)` → `repo.DraftChain(ctx, m); repo.CommitChain(ctx, key, txHash)`
+- `repo.Fetch(ctx, pk)` → `repo.Fetch(ctx, pk, false)` (or `true` for overlay)
+
+### Flipping `chain-drafts: true → false`
+
+- DDL: drop the `status` column, the partial unique index, the state-machine
+  trigger, and the `<name>s_with_drafts` view. Re-create `<name>s` from the
+  regenerated DDL (the join semantics change — it drops the `status='CREATED'`
+  filter from each chain-side JOIN).
+- All in-flight DRAFTED rows will be silently promoted to CREATED when the
+  column is dropped — back up the table before migrating if those rows
+  represent uncommitted intent.
+- Application code: revert `Upsert`/`CommitChain` calls to `SaveAll(_, true)`;
+  drop `drafted` parameters from `Fetch`/`FetchBy*` calls.
+
+## Recipes
+
+### Idempotent saves
+
+`SaveAll(_, true)` is already idempotent: the PII upsert is a no-op (or just
+bumps `updated_at`) when nothing changed, and the chain skip-if-unchanged
+guard prevents new chain versions when every field value matches the latest
+stored one. Re-running an import job is safe.
+
+### "Who last updated this row?"
+
+Query `AuditLog` and take the latest row:
+
+```go
+rows, _ := repo.AuditLog(ctx, pk)
+if len(rows) > 0 {
+    last := rows[len(rows)-1]
+    fmt.Printf("last updated by %s at %s (%s)\n",
+        last.ChangedBy, last.ChangedAt, last.ChangeType)
+}
+```
+
+There is intentionally no `pii.updated_by` column — keeping the answer in
+the audit table prevents drift between row state and the trail.
+
+### Showing pending edits in the UI
+
+In chain-drafts mode, `View.HasPendingDrafts` is populated regardless of
+which view you query, so a single committed-view read can drive both the
+"current values" display and a "you have pending changes" badge:
+
+```go
+v, _ := repo.Fetch(ctx, pk, false)
+if v.HasPendingDrafts {
+    overlay, _ := repo.Fetch(ctx, pk, true)
+    // Render v.* as the committed values + overlay.* as the pending preview.
+}
+```
+
+### Per-field version diff
+
+`ChangeLog` returns the full history. To compute a diff between two
+versions of a field:
+
+```go
+log, _ := repo.ChangeLog(ctx, key)
+amount := log["amount"]
+prev := amount[2].Value
+curr := amount[3].Value
+fmt.Printf("amount: %s → %s\n", prev, curr)
+```
+
+### Round-trip mutate
+
+```go
+view, _ := repo.Fetch(ctx, pk)         // OFF mode
+base := view.AsBaseModel()             // *T proto, ready to mutate
+base.Country = "DE"
+_ = repo.SaveAll(ctx, base, true)      // skip-if-unchanged for everything else
+```
+
+In ON mode the equivalent is `view.AsBaseModel()` → mutate → `repo.Upsert(ctx, base)`
+→ `repo.CommitChain(ctx, pk, txHash)`.
+
+### Erasing a user's PII (right-to-forget)
+
+```go
+_ = db.Unscoped().Delete(&user.UserPii{Id: u.Id}).Error
+```
+
+Hard-delete drops the PII row entirely; chain history persists (it never
+held the PII, only chain-stored fields). `AuditLog` captures a
+`change_type='DELETE'` row with `last_value = row_to_json(OLD)::jsonb` —
+that includes the deleted PII columns. To erase the audit trail too:
+
+```sql
+DELETE FROM audit_pii_users WHERE ref_id = $1;
+```
+
+(Chain rows for that key contain no PII — `(sdm.pii)` fields are routed to
+PII, not chain — so they're safe to retain.)
+
+### Bulk import from a non-Go pipeline
+
+Insert chain rows directly via SQL. The trigger fills in `version` and the
+view picks the latest:
+
+```sql
+INSERT INTO chain_users (key, field_name, field_value, created_by)
+VALUES ('u_001', 'country', 'IN', 'importer-svc');
+-- version is set by chain_users_set_version_trigger
+```
+
+For chain-drafts ON the row will default to `status='CREATED'` (the column
+default), so external loaders that don't know about the draft workflow
+will write directly committed rows — the safer fallback.
+
+## Testing patterns
+
+The generated repo + GORM combo tests cleanly against a real Postgres via
+[testcontainers-go](https://golang.testcontainers.org/). The demo at
+[sdm-example/demo/integration](https://github.com/jinuthankachan/sdm-examples/tree/main/demo/integration)
+is the canonical reference; the patterns below summarize how it's organized.
+
+### Build tags per mode
+
+Because the repo surface differs across config combinations, tests are
+split across files using Go build tags so that one source tree can verify
+all generations:
+
+| Tag combo | Run when |
+|---|---|
+| (no tags) | `chain-drafts: false` + `create-audit-tables: true` (default) |
+| `noaudit` | `create-audit-tables: false` (any chain-drafts) |
+| `chaindrafts` | `chain-drafts: true` + `create-audit-tables: true` |
+| `chaindrafts noaudit` | both off |
+
+Tests using `SaveAll` are tagged `//go:build !chaindrafts`; tests using
+`Upsert` / `CommitChain` are tagged `//go:build chaindrafts`. Audit tests
+add `&& !noaudit`. Mode-agnostic helpers (TestMain, schema loading) live
+in untagged setup files.
+
+### TestMain that spins a container per package
+
+```go
+func TestMain(m *testing.M) {
+    ctx := context.Background()
+    container, _ := tcpostgres.Run(ctx,
+        "postgres:16-alpine",
+        tcpostgres.WithDatabase("test"),
+        tcpostgres.WithUsername("u"),
+        tcpostgres.WithPassword("p"),
+        testcontainers.WithWaitStrategy(
+            wait.ForLog("database system is ready").WithOccurrence(2),
+        ),
+    )
+    defer container.Terminate(ctx)
+
+    dsn, _ := container.ConnectionString(ctx, "sslmode=disable")
+    db, _ := gorm.Open(gormpg.Open(dsn), &gorm.Config{})
+    testDB = db
+    applySchemaFile(db, "../models/sql/user_sdm_schema.sql")
+    applySchemaFile(db, "../models/sql/invoice_sdm_schema.sql")
+    os.Exit(m.Run())
+}
+```
+
+### Reset between tests
+
+A `resetTables(t)` helper truncates everything and resets BIGSERIAL
+counters; call it at the top of each test. Two variants — one that also
+truncates `audit_pii_*` (tagged `!noaudit`), one that doesn't.
+
+### Audit assertions
+
+Decode `LastValue` and assert on it:
+
+```go
+rows, _ := repo.AuditLog(ctx, u.Id)
+var snap map[string]any
+json.Unmarshal(rows[0].LastValue, &snap)
+require.Equal(t, "alice@example.com", snap["email"])  // OLD row's value
+require.Equal(t, "UPDATE", rows[0].ChangeType)
+require.Equal(t, "bob", rows[0].ChangedBy)            // from WithActor in the second SaveAll
+```
+
+## Operational notes
+
+### Chain table growth
+
+Chain is append-only. Every field change adds a row. Skip-if-unchanged
+prevents no-op writes, but rows for the same `(key, field_name)` accumulate
+in proportion to how often that field changes. For high-cardinality fields
+(e.g., a `last_seen_at` updated per request), prefer storing on the PII
+table (via `(sdm.query_index)=true`) so it lives as a normal column rather
+than as a versioned chain field.
+
+A `(key, field_name)` partial index makes "latest version" lookups fast,
+but full chain scans (e.g., `ChangeLog`) scale with row count. If you
+need to retain history for years, consider periodic archival to a
+partitioned shadow table outside the live `chain_<name>s`.
+
+### Transaction semantics
+
+Every generated write method opens a single `db.Transaction(func(tx)
+...)`. PII write + chain inserts + (when applicable) the `sdm.actor`
+session-var install run in one transaction. The audit trigger fires from
+the same transaction, so audit attribution is consistent with the
+mutating write — there's no window in which `pii.updated_at` advances but
+the audit row is missing.
+
+In chain-drafts mode, `Create`/`Upsert`/`Update` commit the PII row and
+stage chain rows as DRAFTED in **one** transaction; `CommitChain` is a
+**second** transaction (PII is already committed at this point). If
+atomicity across the PII+chain boundary matters, hold both writes inside
+your own outer transaction:
+
+```go
+err := db.Transaction(func(tx *gorm.DB) error {
+    r := invoice.NewInvoiceRepo(tx)            // re-wrap for the outer tx
+    if err := r.Upsert(ctx, inv); err != nil { return err }
+    return r.CommitChain(ctx, inv.InvoiceId, txHash)
+})
+```
+
+### Read-after-write through the view
+
+The view joins `pii_<name>s p` with subqueries against `chain_<name>s`.
+Within the same transaction as a write, the view sees the new rows
+immediately (Postgres MVCC). Across transactions, standard read-committed
+semantics apply.
+
+### Concurrency
+
+The `chain_<name>s_set_version_trigger` reads `MAX(version)` under each
+`INSERT` — two concurrent inserts for the same `(key, field_name)` will
+race the read and one will violate the composite PK. Wrap your write
+methods in a retry loop if you expect concurrent drafts for the same
+field; the retry can simply re-run the same write (skip-if-unchanged
+makes it idempotent).
+
+The partial unique index on `(key, field_name) WHERE status='DRAFTED'`
+prevents two concurrent `DraftChain` calls for the same field — one wins,
+the other gets `ErrPendingDraftExists`.
+
+### Postgres version
+
+DDL relies on `CREATE OR REPLACE TRIGGER`, partial unique indexes, `JSONB`,
+`row_to_json(OLD)::jsonb`, and `current_setting(name, true)`. All of
+these are stable in Postgres ≥ 12. The CI demo runs against
+`postgres:16-alpine`.
+
+## Limitations and roadmap
+
+- **Atomic PII + chain commit in chain-drafts mode**. Today
+  `Create`/`Upsert`/`Update` commit the PII row and stage chain rows as
+  DRAFTED in one transaction; `CommitChain` is a second transaction. The
+  contract is "PII reflects immediately; chain values lag until you commit
+  or drop". Wrap both calls in your own outer transaction (above) when you
+  need true atomicity. Generator-side support for one-step commit is on the
+  roadmap.
+- **Composite primary keys** are supported, but the chain key is composed
+  with `':'` as the separator (`OLD.a::text || ':' || OLD.b::text`). Don't
+  use `':'` in PK values without escaping.
+- **Repeated message in chain history**. Chain stores `repeated MessageType`
+  as a single JSON array column; per-element diffs aren't surfaced. If you
+  need element-level history, model each element as its own message.
+- **`(sdm.json)=true` strings** are stored verbatim and JSON-validated by
+  Postgres on cast. Malformed JSON surfaces as a Postgres error on
+  `Fetch` (the view casts `field_value::jsonb`).
+- **No PII-side history versioning**. PII is a single-row snapshot;
+  per-change history lives in `audit_pii_*` (when enabled). There is no
+  per-field version log for PII fields the way there is for chain fields.
+- **`ExistsBy<X>` on chain-only fields fails**. The method probes the PII
+  table, but a chain-only field (e.g., `pan` in the demo) has no PII
+  column — the SQL errors. Documented in the demo as a "known SDM quirk";
+  a future generator pass should route the probe to the view instead.
+- **No native enum mapping in DDL**. Enum fields are stored as TEXT in PII
+  / chain. `AsBaseModel` recovers the typed enum via the proto-generated
+  `<EnumType>_value` map.
+
+## Using with buf directly
+
+```bash
+go install github.com/kapow-tech/sdm/cmd/protoc-gen-sdm@latest
+```
+
+```yaml
+# buf.gen.yaml
+version: v1
+plugins:
+  - plugin: go
+    out: .
+    opt: paths=source_relative
+  - plugin: sdm
+    out: .
+    opt:
+      - paths=source_relative
+      - create-audit-tables=true   # default; omit or set false
+      - chain-drafts=false         # default; omit or set true
+```
+
+```bash
+buf generate
+```
+
+`protoc-gen-sdm` reads its options from `--sdm_opt=key=value` (one per
+line in `buf.gen.yaml` as shown above, or comma-separated when invoked
+through `protoc`).
+
+## Project layout
+
+```
+sdm/
+├── cmd/
+│   ├── sdm/                 # CLI (config / setup / generate)
+│   └── protoc-gen-sdm/      # protoc plugin entry point
+├── pkg/
+│   ├── config/              # sdm.cfg.yaml load / write
+│   └── generator/           # code generator (split by artifact)
+│       ├── generator.go     # entry points + Options
+│       ├── helpers.go       # sdm_helpers.go emission
+│       ├── models.go        # <name>_sdm_model.go emission
+│       ├── sql.go           # <name>_sdm_schema.sql emission
+│       ├── repo.go          # <name>_sdm_repo.go emission
+│       └── fields.go        # per-field / per-message introspection
+├── sdmprotos/
+│   └── annotations.proto    # field option extensions
+├── buf.yaml / buf.gen.yaml  # for regenerating annotations.pb.go
+├── Makefile                 # proto-gen, build
+└── README.md                # this file
+```
+
+`sdm-example/demo` (a separate repository checkout) holds the end-to-end
+proto + generated + tested example.
+
+## Contributing
+
+Local development loop:
+
+```bash
+# Rebuild the CLI + plugin
+go install ./cmd/sdm ./cmd/protoc-gen-sdm
+
+# Regenerate the SDM annotation proto (only when sdmprotos/annotations.proto changes)
+make proto-gen
+
+# Exercise the demo against the in-progress generator
+cd ../sdm-example/demo
+sdm generate
+go test ./integration/...           # OFF + audit
+go test -tags chaindrafts ./integration/...   # ON + audit
+go test -tags 'chaindrafts noaudit' ./integration/...
+go test -tags noaudit ./integration/...
+```
+
+The demo's integration tests are the contract for generator behavior —
+adding a feature means adding tests there first, then making the
+generator emit code that passes them. When changing generated code,
+spot-check the demo's `models/` tree (`git diff models/`) so unintended
+emission changes are visible.
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE) in the repository root.
