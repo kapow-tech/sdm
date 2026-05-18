@@ -142,6 +142,10 @@ func goTypeForField(field *protogen.Field) string {
 			return "string"
 		case protoreflect.Int64Kind, protoreflect.Int32Kind:
 			return "int64"
+		case protoreflect.DoubleKind:
+			return "float64"
+		case protoreflect.FloatKind:
+			return "float32"
 		default:
 			return "string"
 		}
@@ -184,6 +188,8 @@ func sqlTypeForField(field *protogen.Field, opts SdmOptions) string {
 			return "TEXT"
 		case protoreflect.Int64Kind, protoreflect.Int32Kind:
 			return "BIGINT"
+		case protoreflect.DoubleKind, protoreflect.FloatKind:
+			return "DOUBLE PRECISION"
 		default:
 			return "TEXT"
 		}
