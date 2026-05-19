@@ -24,11 +24,18 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 	// from ctx is emitted — that's every PII / chain mutation method, so any
 	// SDM record in the file pulls it in.
 	needSdmRuntime := false
+	// gorm/clause is only referenced from the ON-CONFLICT upsert path —
+	// SaveAll (OFF mode) and Upsert (ON mode), both PII-backed only.
+	// A file with nothing but chain-only messages must not import it.
+	needClause := false
 	for _, msg := range file.Messages {
 		if !isSdmRecord(msg) {
 			continue
 		}
 		needSdmRuntime = true
+		if !isChainOnly(msg) {
+			needClause = true
+		}
 		for _, field := range msg.Fields {
 			opts := getFieldOptions(field)
 			if opts.Hashed {
@@ -90,7 +97,9 @@ func generateRepo(gen *protogen.Plugin, file *protogen.File, opts Options) {
 		g.P(`	"gorm.io/datatypes"`)
 	}
 	g.P(`	"gorm.io/gorm"`)
-	g.P(`	"gorm.io/gorm/clause"`)
+	if needClause {
+		g.P(`	"gorm.io/gorm/clause"`)
+	}
 	g.P(")")
 	g.P()
 
